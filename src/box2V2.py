@@ -189,8 +189,6 @@ def _find_sfdoc(form):
     """
     Recursively walks the form's control tree and returns the Form object
     of the subform named SFDOC_SUBFORM_NAME, or None if not found.
-    This avoids touching the parent form's Recordset (and its current-record
-    pointer), which prevents the "sent back to record #1" regression.
     """
     for i in range(form.Controls.Count):
         ctrl = form.Controls(i)
@@ -199,7 +197,6 @@ def _find_sfdoc(form):
                 continue
             if ctrl.Name == SFDOC_SUBFORM_NAME:
                 return ctrl.Form
-            # Descend into nested subforms
             found = _find_sfdoc(ctrl.Form)
             if found is not None:
                 return found
@@ -208,9 +205,17 @@ def _find_sfdoc(form):
     return None
 
 
-# Refreshes only the SFDoc subform and moves to the last record.
-# Never touches the parent form. All COM errors are caught and logged.
 def refresh_ui() -> None:
+    """
+    Two-step refresh strategy:
+      1. Refresh() on the PARENT form — updates bound image controls (photo
+         display) without resetting its current-record pointer. We use
+         Refresh() instead of Requery() on the parent to avoid jumping back
+         to record #1.
+      2. Requery() + MoveLast() on SFDoc only — reloads the document list
+         and positions it on the newly added entry.
+    All COM errors are caught and logged so the worker thread is never blocked.
+    """
     if not WIN32_AVAILABLE:
         return
     try:
@@ -220,15 +225,24 @@ def refresh_ui() -> None:
             log.warning("Refresh skipped: no active form in Access.")
             return
 
+        # --- Step 1: Refresh the parent form to update image controls ---
+        # Refresh() repaints bound controls from the current record without
+        # moving the record pointer, so the consultation stays in place.
+        try:
+            form.Refresh()
+            log.info(f"Refresh() on parent form '{form.Name}'")
+        except Exception as e_ref:
+            log.warning(f"Refresh() on parent form failed ({e_ref}), continuing...")
+
+        # --- Step 2: Requery SFDoc to load the new document row ---
         sfdoc = _find_sfdoc(form)
         if sfdoc is None:
             log.warning(
                 f"Subform '{SFDOC_SUBFORM_NAME}' not found in the active form. "
-                "Refresh skipped."
+                "SFDoc refresh skipped."
             )
             return
 
-        # --- Requery the subform only ---
         try:
             sfdoc.Requery()
             log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}'")
@@ -240,12 +254,12 @@ def refresh_ui() -> None:
             try:
                 sfdoc.Refresh()
                 log.info(f"Refresh() on '{SFDOC_SUBFORM_NAME}'")
-            except Exception as e_ref:
+            except Exception as e_ref2:
                 log.warning(
-                    f"Refresh() also unavailable on '{SFDOC_SUBFORM_NAME}' ({e_ref})"
+                    f"Refresh() also unavailable on '{SFDOC_SUBFORM_NAME}' ({e_ref2})"
                 )
 
-        # --- Navigate to the last record so the new document is visible ---
+        # Navigate to the last record so the new document is visible
         try:
             sfdoc.Recordset.MoveLast()
             log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}'")
@@ -302,7 +316,6 @@ def _try_rmdir(folder: Path) -> None:
             log.debug(f"Folder not removed (non-empty or missing): {folder}")
     except Exception as e:
         log.debug(f"_try_rmdir({folder}) ignored: {e}")
-
 
 # Worker thread function that processes files from the queue, with patient lookup, file moving,
 # DB insertion, and UI refresh logic
@@ -443,13 +456,12 @@ def worker(file_queue: queue.Queue) -> None:
             description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             if insert_document(patient, relative_path, description):
-                # Raise the flag — refresh fires at burst end, not immediately
                 needs_refresh = True
                 log.debug("Insert OK — needs_refresh=True (refresh deferred to burst end).")
             else:
                 log.warning("Insert failed, refresh flag unchanged.")
 
-            # Clean up scan folders last, after file transfer and DB insert
+            # Clean up scan folders after file transfer and DB insert
             if is_nidek:
                 _try_rmdir(scan_dir)
                 _try_rmdir(main_dir)
@@ -489,7 +501,7 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Image Router v3.7 started")
+    log.info("Image Router v3.8 started")
     log.info(f"  Source     : {SOURCE_DIR}")
     log.info(f"  Dest       : {DEST_PHOTOS}")
     log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
@@ -524,7 +536,6 @@ def main() -> None:
             file_queue.join()
 
         log.info("Image Router stopped.")
-
 
 if __name__ == "__main__":
     main()

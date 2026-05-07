@@ -1,3 +1,55 @@
+"""
+box2.py — Image Router, Version 2 (initial Nidek-aware release)
+================================================================
+This module monitors a source directory for incoming medical image files
+and automatically routes each one to the correct patient folder, then
+registers the file in the StudioVision Access database (PUBLIC.MDB).
+
+Processing pipeline for every detected file
+-------------------------------------------
+1. A Watchdog observer detects a new file in SOURCE_DIR and places it on
+   a thread-safe queue (producer role).
+2. A single background worker thread consumes the queue one item at a time
+   (consumer role), preventing concurrent writes to the same patient folder
+   and the same database table.
+3. The worker waits for the file to be fully written (lock-check loop), then
+   queries the currently open Access patient form via COM automation to
+   identify the destination patient.
+4. If no patient form is visible the worker polls every PATIENT_POLL_INTERVAL
+   seconds for up to PATIENT_WAIT_TIMEOUT seconds; if the timeout expires the
+   file is moved to ORPHAN_DIR.
+5. The patient's folder on disk is resolved from an existing record in the
+   PUBLIC.MDB Documents table.
+6. The file is moved to the patient's photo folder and a new Documents row is
+   inserted into PUBLIC.MDB with the appropriate description (Image / OCT /
+   DICOM).
+7. The Access UI is requeried immediately after the insert so the new document
+   appears without a manual refresh.
+
+Nidek device handling
+---------------------
+Nidek retinal cameras export a scan as a subdirectory tree:
+  SOURCE_DIR/<device>/<scan_id>/<image(s)> [+ XML metadata]
+
+For each scan directory the worker:
+  - Deletes all XML metadata files (not needed by StudioVision).
+  - Selects only the largest image file (the full-resolution export) and
+    discards smaller thumbnails.
+  - Tracks processed scan directories so that residual files still in the
+    queue are silently removed rather than triggering duplicate processing.
+
+Dependencies
+------------
+  - watchdog  : cross-platform filesystem event monitoring
+  - pyodbc    : ODBC connection to Microsoft Access (.mdb) databases
+  - pywin32   : COM automation of the running Access.Application instance
+  - pythoncom : COM initialisation / teardown required per thread
+
+Configuration
+-------------
+All paths (SOURCE_DIR, DEST_PHOTOS, PUBLIC_MDB, DOCUM_MDB, ORPHAN_DIR)
+must be set to valid Windows UNC or local paths before deployment.
+"""
 import pythoncom
 import queue
 import shutil
@@ -69,14 +121,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("image_router")
 
-# Helper to connect to an Access MDB with pyodbc, with error handling deferred to caller
 def db_connect(mdb_path: Path):
+    """Establishes a connection to the specified Access MDB file using pyodbc.
+
+    Args:
+        mdb_path (Path): The file path of the MDB file to connect to.
+
+    Returns:
+        pyodbc.Connection: A connection object for the MDB file.
+    """
     return pyodbc.connect(
         f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
     )
 
-# Returns a dict with patient info if an Access form with the expected fields is active, else None
 def get_active_patient() -> dict | None:
+    """Retrieves patient information from the active Access form.
+
+    The function checks if the expected fields are present and returns their
+    values as a dictionary. If the form is not active or the fields are
+    missing, None is returned.
+
+    Returns:
+        dict | None: A dictionary with patient information or None if not available.
+    """
     if not WIN32_AVAILABLE:
         return None
     try:
@@ -109,9 +176,15 @@ def get_active_patient() -> dict | None:
         log.debug(f"COM error: {e}")
         return None
 
-# Uses the PUBLIC.MDB Documents table to resolve the patient's photo folder,
-# returning a Path if successful or None if any step fails
 def find_patient_folder(patient_code: str) -> Path | None:
+    """Finds the folder where patient photos are stored based on the patient code.
+
+    Args:
+        patient_code (str): The code of the patient whose folder is to be found.
+
+    Returns:
+        Path | None: The path to the patient's folder or None if not found.
+    """
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
@@ -149,8 +222,17 @@ def find_patient_folder(patient_code: str) -> Path | None:
         log.error(f"DB folder lookup failed: {e}")
         return None
 
-# Inserts a new record into PUBLIC.MDB Documents for the given patient, relative path, and description.
 def insert_document(patient: dict, relative_path: str, description: str) -> bool:
+    """Inserts a new document record into the PUBLIC.MDB database.
+
+    Args:
+        patient (dict): A dictionary with patient information (code, nom, prenom).
+        relative_path (str): The relative path of the document to be inserted.
+        description (str): A description of the document (e.g., Image, OCT, DICOM).
+
+    Returns:
+        bool: True if the insert was successful, False otherwise.
+    """
     if not PYODBC_AVAILABLE:
         log.warning("pyodbc not available, insert skipped.")
         return False
@@ -184,8 +266,16 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
 # Access constant for subform control type
 _AC_SUBFORM = 112
 
-# Requery the form to show the new document, with a fallback to Refresh() if Requery() is unavailable
 def _requery_form(form) -> None:
+    """Requeries the specified Access form to refresh its data.
+
+    This function attempts to call the Requery() method on the form and falls
+    back to Refresh() if Requery() is not available. It also recursively
+    requeried subforms.
+
+    Args:
+        form: The Access form object to be requeried.
+    """
     
     # Recurse into subforms first so their data is fresh before the parent is requeried
     for i in range(form.Controls.Count):
@@ -207,8 +297,14 @@ def _requery_form(form) -> None:
         except Exception as e_ref:
             log.warning(f"Refresh() also unavailable on '{form.Name}' ({e_ref})")
 
-# After requerying, move to the last record in the document subform to show the newly added document
 def _goto_last_record(form) -> None:
+    """Moves to the last record in the document subform to display the latest document.
+
+    This function recursively navigates through subforms if necessary.
+
+    Args:
+        form: The Access form object containing the subform.
+    """
     for i in range(form.Controls.Count):
         ctrl = form.Controls(i)
         try:
@@ -222,9 +318,17 @@ def _goto_last_record(form) -> None:
         except Exception as e:
             log.debug(f"MoveLast failed on '{getattr(ctrl, 'Name', '?')}': {e}")
 
-# Refreshes the active Access form to show the newly added document,
-# with error handling to avoid blocking the worker thread if Access is not responsive
 def refresh_ui() -> None:
+    """Refreshes the active Access form to display the latest document.
+
+    The function uses COM automation to access the running instance of
+    Access.Application and attempts to requery the active form. If the form
+    cannot be requeried, the function fails silently to avoid blocking the
+    worker thread.
+
+    Returns:
+        None
+    """
     if not WIN32_AVAILABLE:
         return
     try:
@@ -238,8 +342,19 @@ def refresh_ui() -> None:
     except Exception as e:
         log.warning(f"COM refresh failed (non-blocking): {e}")
 
-# Tries to open the file for reading to check if it's still locked by the writing process
 def wait_for_file(file: Path) -> bool:
+    """Waits for a file to be unlocked by the writing process.
+
+    The function retries opening the file for reading several times with a
+    delay, to check if the file is still locked. If the file cannot be opened
+    after the maximum number of attempts, the function logs an error.
+
+    Args:
+        file (Path): The file path to be checked.
+
+    Returns:
+        bool: True if the file is unlocked and can be opened, False otherwise.
+    """
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
             with file.open("rb"):
@@ -250,8 +365,21 @@ def wait_for_file(file: Path) -> bool:
     log.error(f"File still locked after {FILE_LOCK_MAX_ATTEMPTS} attempts: {file}")
     return False
 
-# Moves the file to the destination folder, handling name conflicts by appending a timestamp
 def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
+    """Moves a file to the specified destination folder, renaming it if necessary.
+
+    If a file with the same name already exists in the destination folder, the
+    file is renamed by appending a timestamp to its name. The function logs the
+    move operation.
+
+    Args:
+        source (Path): The source file path to be moved.
+        dest_folder (Path): The destination folder where the file should be moved.
+        label (str, optional): An optional label to prefix the log message. Defaults to "".
+
+    Returns:
+        Path | None: The path to the moved file in the destination folder, or None if the move failed.
+    """
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
 
@@ -269,13 +397,34 @@ def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
         log.error(f"Move failed: {e}")
         return None
 
-# Moves the file to the orphan folder with a warning log
 def orphan_file(file: Path) -> None:
+    """Moves a file to the orphan folder and logs a warning.
+
+    The orphan folder is used to store files that could not be processed or
+    assigned to a patient. The function logs the orphaning action.
+
+    Args:
+        file (Path): The file path to be moved to the orphan folder.
+
+    Returns:
+        None
+    """
     log.warning(f"Orphaning: {file.name}")
     move_file(file, ORPHAN_DIR, label="ORPHAN")
 
-# Removes a folder only if it is strictly empty; fails silently otherwise
 def _try_rmdir(folder: Path) -> None:
+    """Attempts to remove a folder if it is empty.
+
+    The function checks if the folder is a directory and if it is empty before
+    attempting to remove it. If the folder cannot be removed, the function fails
+    silently.
+
+    Args:
+        folder (Path): The folder path to be removed.
+
+    Returns:
+        None
+    """
     try:
         if folder.is_dir() and not any(folder.iterdir()):
             folder.rmdir()
@@ -285,9 +434,24 @@ def _try_rmdir(folder: Path) -> None:
     except Exception as e:
         log.debug(f"_try_rmdir({folder}) ignored: {e}")
 
-# Worker thread function that processes files from the queue, with patient lookup, file moving,
-# DB insertion, and UI refresh logic
 def worker(file_queue: queue.Queue) -> None:
+    """The worker function that processes image files from the queue.
+
+    This function runs in a background thread and performs the following steps for
+    each file in the queue:
+    - Waits for the file to be fully written and unlocked.
+    - Identifies the patient by checking the active Access form.
+    - Resolves the patient's photo folder from the database.
+    - Moves the file to the patient's folder.
+    - Inserts a new document record into the database.
+    - Refreshes the Access UI to show the new document.
+
+    Args:
+        file_queue (queue.Queue): The thread-safe queue containing the files to be processed.
+
+    Returns:
+        None
+    """
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
@@ -436,7 +600,6 @@ def worker(file_queue: queue.Queue) -> None:
     finally:
         pythoncom.CoUninitialize()
 
-# Watchdog event handler that enqueues new image files for processing by the worker thread
 class ImageProducer(FileSystemEventHandler):
     def __init__(self, file_queue: queue.Queue) -> None:
         super().__init__()
@@ -451,15 +614,24 @@ class ImageProducer(FileSystemEventHandler):
         log.info(f"Enqueued: {file.name} (queue size: {self._queue.qsize() + 1})")
         self._queue.put(file)
 
-# Main function to start the image router
 def main() -> None:
+    """Main function to start the image routing process.
+
+    This function initializes the source and destination directories, sets up
+    the orphan directory, and starts the Watchdog observer and the worker
+    thread. It also logs the initial configuration and waits for the observer
+    to stop on exit.
+
+    Returns:
+        None
+    """
     if not SOURCE_DIR.exists():
         log.critical(f"Source folder not found: {SOURCE_DIR}")
         sys.exit(1)
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Image Router v3.6 started")
+    log.info("Version 2 started")
     log.info(f"  Source     : {SOURCE_DIR}")
     log.info(f"  Dest       : {DEST_PHOTOS}")
     log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")

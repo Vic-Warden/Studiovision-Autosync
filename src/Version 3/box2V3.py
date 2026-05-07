@@ -681,6 +681,32 @@ class ImageProducer(FileSystemEventHandler):
         self._queue.put(file)
 
 
+def clear_source_dir() -> None:
+    """
+    Vide entièrement SOURCE_DIR au démarrage du programme.
+    Supprime tous les fichiers et sous-dossiers présents dans SOURCE_DIR,
+    mais conserve SOURCE_DIR lui-même.
+    Appelé une seule fois, après que le partage réseau soit confirmé accessible.
+    """
+    items = list(SOURCE_DIR.iterdir())
+    if not items:
+        log.info(f"Source directory already empty: {SOURCE_DIR}")
+        return
+
+    log.info(f"Clearing {len(items)} item(s) from source directory at startup...")
+    for item in items:
+        try:
+            if item.is_dir():
+                shutil.rmtree(str(item))
+                log.info(f"Deleted folder: {item.name}")
+            else:
+                item.unlink()
+                log.info(f"Deleted file: {item.name}")
+        except Exception as e:
+            log.warning(f"Could not delete {item.name}: {e}")
+    log.info("Source directory cleared.")
+
+
 def main() -> None:
     """
     Application entry point for Box 2, Version 3.
@@ -701,6 +727,9 @@ def main() -> None:
     if not SOURCE_DIR.exists():
         log.critical(f"Source folder not found: {SOURCE_DIR}")
         sys.exit(1)
+
+    # Clean up any leftover files/folders in SOURCE_DIR before starting the observer.
+    clear_source_dir()
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -6,3 +6,5 @@ bdd/
 
 # Ignore test files
 tests/.DS_Store
+
+tests/test_file_manager.ipynb

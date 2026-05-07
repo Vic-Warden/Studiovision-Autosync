@@ -1,3 +1,40 @@
+"""
+windows7V2.py — Image Router, Windows 7 / Python 2-compatible variant (Version 2)
+===================================================================================
+This module provides the same image-routing functionality as box2V2.py but is
+written for compatibility with **Python 2 / Windows 7** environments where:
+  - f-strings are not available (``str.format()`` is used instead).
+  - PEP 604 union types (``X | Y``) are not supported (``Optional[X]`` is used
+    from ``typing``).
+  - ``queue.get(timeout=...)`` is used for the burst-debounce logic, identical
+    to box2V2.py.
+
+Behavioural differences from box2V2.py
+---------------------------------------
+- Logging calls use the ``%``-style format arguments accepted by the standard
+  ``logging`` module rather than f-strings, which avoids string interpolation
+  when the log level is suppressed.
+- ``refresh_ui()`` operates exclusively on the SFDoc subform (no parent-form
+  Refresh step), keeping the consultation record pointer unchanged.
+- No Nidek-specific processing: this variant targets scanners that drop flat
+  image files directly into SOURCE_DIR without creating per-scan sub-folders.
+
+Processing pipeline
+-------------------
+1. Watchdog observer detects new files in SOURCE_DIR → enqueued (producer).
+2. Single background worker thread consumes the queue (consumer).
+3. Lock-wait loop ensures the file is fully written before processing.
+4. COM automation reads the active Access patient form.
+5. Patient polling loop with PATIENT_WAIT_TIMEOUT guard; orphans on timeout.
+6. Patient folder resolved from PUBLIC.MDB.
+7. File moved to patient's photo folder.
+8. New Documents row inserted into PUBLIC.MDB.
+9. UI refresh deferred until queue is idle for 1.5 s (burst debounce).
+
+Dependencies
+------------
+  watchdog, pyodbc, pywin32, pythoncom
+"""
 import pythoncom
 import queue
 import shutil
@@ -7,6 +44,7 @@ import time
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -22,7 +60,7 @@ try:
 except ImportError:
     PYODBC_AVAILABLE = False
 
-# Configuration
+# Configuration 
 SOURCE_DIR  = Path(r"??")
 ORPHAN_DIR  = Path(r"??")
 DEST_PHOTOS = Path(r"??")
@@ -44,7 +82,8 @@ ACCESS_FIELD_PRENOM = "Prénom"
 # Name of the subform that lists documents
 SFDOC_SUBFORM_NAME = "SFDoc"
 
-# Description inserted into the database per file type
+# Description to use in the database for each file type;
+# default is "Image" except for TIFF which is "OCT" and DICOM which is "DICOM"
 EXAM_DESCRIPTION = {
     ".jpg":  "Image",
     ".jpeg": "Image",
@@ -56,34 +95,29 @@ EXAM_DESCRIPTION = {
     ".dcm":  "DICOM",
 }
 
-import os
-_log_path = os.path.join(os.path.expanduser("~"), "studiovision", "image_router.log")
-os.makedirs(os.path.dirname(_log_path), exist_ok=True)
-
+# Configure logging to file and console with timestamps and thread names
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(_log_path, encoding="utf-8"),
+        logging.FileHandler("image_router.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger("image_router")
 
 
-def db_connect(mdb_path: Path):
-    """Return a pyodbc connection to an Access MDB file."""
+def db_connect(mdb_path):
+    """Helper to connect to an Access MDB with pyodbc."""
     return pyodbc.connect(
-        f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
+        "DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=" + str(mdb_path) + ";"
     )
 
 
-def get_active_patient() -> dict | None:
-    """
-    Return patient info from the currently active Access form, or None if
-    the form is unavailable or missing the expected fields.
-    """
+def get_active_patient():
+    # type: () -> Optional[dict]
+    """Returns patient info from the active Access form, or None if unavailable."""
     if not WIN32_AVAILABLE:
         return None
     try:
@@ -93,7 +127,7 @@ def get_active_patient() -> dict | None:
             return None
 
         target = {ACCESS_FIELD_CODE, ACCESS_FIELD_NOM, ACCESS_FIELD_PRENOM}
-        data: dict = {}
+        data   = {}
 
         for i in range(form.Controls.Count):
             ctrl = form.Controls(i)
@@ -113,20 +147,18 @@ def get_active_patient() -> dict | None:
         }
 
     except Exception as e:
-        log.debug(f"COM error: {e}")
+        log.debug("COM error: %s", e)
         return None
 
 
-def find_patient_folder(patient_code: str) -> Path | None:
-    """
-    Resolve the patient's photo folder from PUBLIC.MDB.
-    Returns the folder Path on success, or None on any failure.
-    """
+def find_patient_folder(patient_code):
+    # type: (str) -> Optional[Path]
+    """Resolves the patient's photo folder from PUBLIC.MDB. Returns a Path or None."""
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
     if not PUBLIC_MDB.exists():
-        log.error(f"PUBLIC.MDB not found: {PUBLIC_MDB}")
+        log.error("PUBLIC.MDB not found: %s", PUBLIC_MDB)
         return None
     try:
         conn   = db_connect(PUBLIC_MDB)
@@ -140,31 +172,29 @@ def find_patient_folder(patient_code: str) -> Path | None:
         conn.close()
 
         if not row or not row[0]:
-            log.warning(f"No existing document found for patient {patient_code}.")
+            log.warning("No existing document found for patient %s.", patient_code)
             return None
 
         parts = row[0].strip().strip("\\").split("\\")
         if len(parts) < 2:
-            log.error(f"Unexpected Photo externe format: {row[0]}")
+            log.error("Unexpected Photo externe format: %s", row[0])
             return None
 
         folder = DEST_PHOTOS / parts[0] / parts[1]
         if not folder.is_dir():
-            log.error(f"Folder found in DB but missing on disk: {folder}")
+            log.error("Folder found in DB but missing on disk: %s", folder)
             return None
 
-        log.info(f"Patient folder resolved: {folder}")
+        log.info("Patient folder resolved: %s", folder)
         return folder
     except Exception as e:
-        log.error(f"DB folder lookup failed: {e}")
+        log.error("DB folder lookup failed: %s", e)
         return None
 
 
-def insert_document(patient: dict, relative_path: str, description: str) -> bool:
-    """
-    Insert a new record into PUBLIC.MDB Documents for the given patient.
-    Returns True on success, False otherwise.
-    """
+def insert_document(patient, relative_path, description):
+    # type: (dict, str, str) -> bool
+    """Inserts a new record into PUBLIC.MDB Documents for the given patient."""
     if not PYODBC_AVAILABLE:
         log.warning("pyodbc not available, insert skipped.")
         return False
@@ -186,23 +216,22 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
         )
         conn.commit()
         conn.close()
-        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={PUBLIC_MDB.name}")
+        log.info(
+            "Insert OK: patient=%s path='%s' db=%s",
+            patient["code"], relative_path, PUBLIC_MDB.name
+        )
         return True
     except Exception as e:
-        log.error(f"DB insert failed: {e}")
+        log.error("DB insert failed: %s", e)
         return False
 
 
-# Access subform control type constant
+# Access constant for subform control type
 _AC_SUBFORM = 112
 
 
 def _find_sfdoc(form):
-    """
-    Recursively search the form's control tree for the subform named
-    SFDOC_SUBFORM_NAME. Returns the subform's Form object, or None.
-    Avoids touching the parent form's Recordset to prevent record-pointer reset.
-    """
+    """Recursively finds the SFDoc subform in the control tree. Returns its Form object or None."""
     for i in range(form.Controls.Count):
         ctrl = form.Controls(i)
         try:
@@ -210,6 +239,7 @@ def _find_sfdoc(form):
                 continue
             if ctrl.Name == SFDOC_SUBFORM_NAME:
                 return ctrl.Form
+            # Descend into nested subforms
             found = _find_sfdoc(ctrl.Form)
             if found is not None:
                 return found
@@ -218,20 +248,9 @@ def _find_sfdoc(form):
     return None
 
 
-def refresh_ui(expected_patient_code: str | None = None) -> None:
-    """
-    Requery only the SFDoc subform and move to the last record.
-    Never touches the parent form's record pointer.
-
-    - If expected_patient_code is provided, verifies the correct patient is
-      still on screen before acting (guards against user switching records
-      during the 1.5 s debounce window).
-    - Exits edit (dirty) state on the parent form before calling Requery(),
-      since Access silently ignores Requery() while a record is being edited.
-    - Retries Requery() up to 3 times with a 0.5 s delay before falling back
-      to Refresh().
-    All COM errors are caught and logged as non-blocking warnings.
-    """
+def refresh_ui():
+    # type: () -> None
+    """Requeried only the SFDoc subform and moves to the last record. Never touches the parent form. All COM errors are caught and logged."""
     if not WIN32_AVAILABLE:
         return
     try:
@@ -241,153 +260,120 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
             log.warning("Refresh skipped: no active form in Access.")
             return
 
-        # Verify the expected patient is still on screen
-        if expected_patient_code is not None:
-            current = get_active_patient()
-            if current is None or current["code"] != expected_patient_code:
-                current_code = current["code"] if current else "none"
-                log.warning(
-                    f"Patient changed since insert "
-                    f"(expected {expected_patient_code}, got {current_code}). "
-                    "Refresh skipped to avoid updating the wrong form."
-                )
-                return
-
-        # Exit edit state before requerying
-        try:
-            if form.Dirty:
-                form.Dirty = False
-                log.info("Parent form was dirty — saved before requery.")
-        except Exception as e_dirty:
-            log.debug(f"Dirty check/save failed (non-blocking): {e_dirty}")
-
         sfdoc = _find_sfdoc(form)
         if sfdoc is None:
             log.warning(
-                f"Subform '{SFDOC_SUBFORM_NAME}' not found in the active form. "
-                "Refresh skipped."
+                "Subform '%s' not found in the active form. Refresh skipped.",
+                SFDOC_SUBFORM_NAME
             )
             return
 
-        # Requery with retry
-        requeried = False
-        for attempt in range(1, 4):
-            try:
-                try:
-                    if form.Dirty:
-                        form.Dirty = False
-                except Exception:
-                    pass
-
-                sfdoc.Requery()
-                log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}' (attempt {attempt})")
-                requeried = True
-                break
-            except Exception as e_req:
-                log.warning(
-                    f"Requery() attempt {attempt}/3 failed on '{SFDOC_SUBFORM_NAME}': {e_req}"
-                )
-                if attempt < 3:
-                    time.sleep(0.5)
-
-        if not requeried:
-            # Fallback: Refresh() updates the display without re-reading the DB
+        # Requery the subform only
+        try:
+            sfdoc.Requery()
+            log.info("Requery() on '%s'", SFDOC_SUBFORM_NAME)
+        except Exception as e_req:
+            log.warning(
+                "Requery() unavailable on '%s' (%s), trying Refresh()...",
+                SFDOC_SUBFORM_NAME, e_req
+            )
             try:
                 sfdoc.Refresh()
-                log.info(f"Fallback Refresh() on '{SFDOC_SUBFORM_NAME}'")
+                log.info("Refresh() on '%s'", SFDOC_SUBFORM_NAME)
             except Exception as e_ref:
                 log.warning(
-                    f"Refresh() also failed on '{SFDOC_SUBFORM_NAME}': {e_ref}"
+                    "Refresh() also unavailable on '%s' (%s)",
+                    SFDOC_SUBFORM_NAME, e_ref
                 )
 
-        # Navigate to the last record to make the new document visible
+        # Navigate to the last record so the new document is visible
         try:
             sfdoc.Recordset.MoveLast()
-            log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}'")
+            log.info("MoveLast() on '%s'", SFDOC_SUBFORM_NAME)
         except Exception as e_ml:
-            log.debug(f"MoveLast() failed on '{SFDOC_SUBFORM_NAME}': {e_ml}")
+            log.debug("MoveLast() failed on '%s': %s", SFDOC_SUBFORM_NAME, e_ml)
 
     except Exception as e:
-        log.warning(f"COM refresh failed (non-blocking): {e}")
+        log.warning("COM refresh failed (non-blocking): %s", e)
 
 
-def wait_for_file(file: Path) -> bool:
-    """Poll until the file is readable, retrying up to FILE_LOCK_MAX_ATTEMPTS times."""
+def wait_for_file(file):
+    # type: (Path) -> bool
+    """Tries to open the file for reading to check if it's still locked."""
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
             with file.open("rb"):
                 return True
         except (PermissionError, OSError):
-            log.debug(f"File locked ({attempt}/{FILE_LOCK_MAX_ATTEMPTS}), retrying...")
+            log.debug("File locked (%d/%d), retrying...", attempt, FILE_LOCK_MAX_ATTEMPTS)
             time.sleep(FILE_LOCK_RETRY_DELAY)
-    log.error(f"File still locked after {FILE_LOCK_MAX_ATTEMPTS} attempts: {file}")
+    log.error("File still locked after %d attempts: %s", FILE_LOCK_MAX_ATTEMPTS, file)
     return False
 
 
-def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
-    """Move source to dest_folder, appending a timestamp on name conflict."""
+def move_file(source, dest_folder, label=""):
+    # type: (Path, Path, str) -> Optional[Path]
+    """Moves the file to dest_folder, resolving name conflicts with a timestamp."""
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
 
     if dest.exists():
         ts   = int(time.time())
-        dest = dest_folder / f"{source.stem}_{ts}{source.suffix}"
-        log.info(f"Name conflict, renamed to {dest.name}")
+        dest = dest_folder / "{0}_{1}{2}".format(source.stem, ts, source.suffix)
+        log.info("Name conflict, renamed to %s", dest.name)
 
     try:
         shutil.move(str(source), str(dest))
-        tag = f"[{label}]  " if label else ""
-        log.info(f"{tag}{source.name} -> {dest}")
+        tag = "[{0}]  ".format(label) if label else ""
+        log.info("%s%s -> %s", tag, source.name, dest)
         return dest
     except Exception as e:
-        log.error(f"Move failed: {e}")
+        log.error("Move failed: %s", e)
         return None
 
 
-def orphan_file(file: Path) -> None:
-    """Move the file to the orphan folder."""
-    log.warning(f"Orphaning: {file.name}")
+def orphan_file(file):
+    # type: (Path) -> None
+    """Moves the file to the orphan folder with a warning log."""
+    log.warning("Orphaning: %s", file.name)
     move_file(file, ORPHAN_DIR, label="ORPHAN")
 
 
-def worker(file_queue: queue.Queue) -> None:
+def worker(file_queue):
+    # type: (queue.Queue) -> None
     """
-    Consume files from the queue and run the full pipeline:
-    lock-wait → patient lookup → move → DB insert.
-    A single UI refresh is fired after the queue has been idle for 1.5 s
-    (burst debounce). The last successfully inserted patient code is passed
-    to refresh_ui() to guard against stale form refreshes.
+    Processes files from the queue. Runs the full pipeline (lock-wait →
+    patient lookup → move → DB insert) for each file, then fires a single
+    UI refresh once the queue has been idle for 1.5 s (burst debounce).
     """
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    needs_refresh: bool = False
-    last_patient_code: str | None = None
+    needs_refresh = False
 
     try:
         while True:
             try:
-                file: Path = file_queue.get(timeout=1.5)
+                file = file_queue.get(timeout=1.5)
             except queue.Empty:
                 if needs_refresh:
                     log.info("Burst complete — triggering batched UI refresh.")
-                    refresh_ui(expected_patient_code=last_patient_code)
+                    refresh_ui()
                     needs_refresh = False
-                    last_patient_code = None
                 continue
             except Exception as e:
-                log.error(f"Queue error: {e}")
+                log.error("Queue error: %s", e)
                 continue
 
-            log.info(f"Processing: {file.name} ({file_queue.qsize()} pending)")
+            log.info("Processing: %s (%d pending)", file.name, file_queue.qsize())
 
             if not file.exists():
-                log.warning(f"File gone before processing: {file}")
+                log.warning("File gone before processing: %s", file)
                 file_queue.task_done()
                 continue
 
             if not wait_for_file(file):
-                log.error(f"Aborting, persistent lock: {file.name}")
+                log.error("Aborting, persistent lock: %s", file.name)
                 file_queue.task_done()
                 continue
 
@@ -409,8 +395,8 @@ def worker(file_queue: queue.Queue) -> None:
 
                 if first_log:
                     log.info(
-                        f"No patient open, waiting "
-                        f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
+                        "No patient open, waiting (timeout in %d min)",
+                        PATIENT_WAIT_TIMEOUT // 60
                     )
                     first_log = False
 
@@ -420,15 +406,15 @@ def worker(file_queue: queue.Queue) -> None:
                 continue
 
             log.info(
-                f"Patient: {patient['nom']} {patient['prenom']} "
-                f"(code {patient['code']})"
+                "Patient: %s %s (code %s)",
+                patient["nom"], patient["prenom"], patient["code"]
             )
 
             patient_folder = find_patient_folder(patient["code"])
             if not patient_folder:
                 log.error(
-                    f"Could not resolve folder for patient {patient['code']}. "
-                    "Orphaning."
+                    "Could not resolve folder for patient %s. Orphaning.",
+                    patient["code"]
                 )
                 orphan_file(file)
                 file_queue.task_done()
@@ -440,17 +426,14 @@ def worker(file_queue: queue.Queue) -> None:
                 continue
 
             group_name    = patient_folder.parent.name
-            relative_path = f"\\{group_name}\\{patient_folder.name}\\{dest.name}"
-            description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
+            relative_path = "\\{0}\\{1}\\{2}".format(
+                group_name, patient_folder.name, dest.name
+            )
+            description = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             if insert_document(patient, relative_path, description):
-                needs_refresh     = True
-                last_patient_code = patient["code"]
-                log.debug(
-                    f"Insert OK — needs_refresh=True, "
-                    f"last_patient_code={last_patient_code} "
-                    "(refresh deferred to burst end)."
-                )
+                needs_refresh = True
+                log.debug("Insert OK — needs_refresh=True (refresh deferred to burst end).")
             else:
                 log.warning("Insert failed, refresh flag unchanged.")
 
@@ -459,48 +442,51 @@ def worker(file_queue: queue.Queue) -> None:
     finally:
         if needs_refresh:
             log.info("Worker shutting down — flushing pending UI refresh.")
-            refresh_ui(expected_patient_code=last_patient_code)
+            refresh_ui()
         pythoncom.CoUninitialize()
 
 
 class ImageProducer(FileSystemEventHandler):
     """Watchdog event handler that enqueues new image files for the worker."""
 
-    def __init__(self, file_queue: queue.Queue) -> None:
-        super().__init__()
+    def __init__(self, file_queue):
+        # type: (queue.Queue) -> None
+        super(ImageProducer, self).__init__()
         self._queue = file_queue
 
-    def on_created(self, event) -> None:
+    def on_created(self, event):
         if event.is_directory:
             return
         file = Path(event.src_path)
         if file.suffix.lower() not in WATCHED_EXTENSIONS:
             return
-        log.info(f"Enqueued: {file.name} (queue size: {self._queue.qsize() + 1})")
+        log.info("Enqueued: %s (queue size: %d)", file.name, self._queue.qsize() + 1)
         self._queue.put(file)
 
 
-def main() -> None:
+def main():
+    # type: () -> None
     if not SOURCE_DIR.exists():
-        log.critical(f"Source folder not found: {SOURCE_DIR}")
+        log.critical("Source folder not found: %s", SOURCE_DIR)
         sys.exit(1)
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("Version 2 started")
-    log.info(f"  Source     : {SOURCE_DIR}")
-    log.info(f"  Dest       : {DEST_PHOTOS}")
-    log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
-    log.info(f"  DOCUM.MDB  : {DOCUM_MDB}")
-    log.info(f"  Orphans    : {ORPHAN_DIR}")
-    log.info(f"  Timeout    : {PATIENT_WAIT_TIMEOUT // 60} min")
-    log.info(f"  Ext        : {', '.join(sorted(WATCHED_EXTENSIONS))}")
+    log.info("  Source     : %s", SOURCE_DIR)
+    log.info("  Dest       : %s", DEST_PHOTOS)
+    log.info("  PUBLIC.MDB : %s", PUBLIC_MDB)
+    log.info("  DOCUM.MDB  : %s", DOCUM_MDB)
+    log.info("  Orphans    : %s", ORPHAN_DIR)
+    log.info("  Timeout    : %d min", PATIENT_WAIT_TIMEOUT // 60)
+    log.info("  Ext        : %s", ", ".join(sorted(WATCHED_EXTENSIONS)))
 
-    file_queue: queue.Queue = queue.Queue()
+    file_queue = queue.Queue()
 
     worker_thread = threading.Thread(
-        target=worker, args=(file_queue,), name="Worker", daemon=True
+        target=worker, args=(file_queue,), name="Worker"
     )
+    worker_thread.daemon = True
     worker_thread.start()
 
     producer = ImageProducer(file_queue)
@@ -520,7 +506,7 @@ def main() -> None:
 
         remaining = file_queue.qsize()
         if remaining:
-            log.info(f"Waiting for {remaining} remaining file(s)...")
+            log.info("Waiting for %d remaining file(s)...", remaining)
             file_queue.join()
 
         log.info("Image Router stopped.")

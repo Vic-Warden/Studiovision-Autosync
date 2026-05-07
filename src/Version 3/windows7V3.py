@@ -1,3 +1,18 @@
+"""
+windows7V3.py
+Image Router — Version 3, Windows 7 compatible build.
+
+Combines all improvements introduced in Version 3 (PollingObserver, network
+share wait, auto-reconnect, targeted SFDoc Requery, dirty-state guard, Requery
+retry loop, patient-code guard, log in ~/studiovision/) with the Windows 7
+Python 3.9 compatibility constraints of the windows7.py baseline (typing.Optional
+instead of X | Y union syntax, str.format() where needed, daemon=True set as an
+attribute rather than a constructor keyword).
+
+See studiovision_monitorV3.py for a detailed description of each improvement.
+"""
+
+import os
 import pythoncom
 import queue
 import shutil
@@ -8,7 +23,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver as Observer   # change 1: PollingObserver for network shares
 from watchdog.events import FileSystemEventHandler
 
 try:
@@ -58,13 +73,18 @@ EXAM_DESCRIPTION = {
     ".dcm":  "DICOM",
 }
 
+# Change 8: log file in ~/studiovision/ so it works correctly as a compiled executable
+_LOG_DIR  = os.path.join(os.path.expanduser("~"), "studiovision")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, "image_router.log")
+
 # Configure logging to file and console with timestamps and thread names
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler("image_router.log", encoding="utf-8"),
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -154,7 +174,6 @@ def find_patient_folder(patient_code):
         log.error("DB folder lookup failed: %s", e)
         return None
 
-
 def insert_document(patient, relative_path, description):
     # type: (dict, str, str) -> bool
     """Inserts a new record into PUBLIC.MDB Documents for the given patient."""
@@ -211,9 +230,22 @@ def _find_sfdoc(form):
     return None
 
 
-def refresh_ui():
-    # type: () -> None
-    """Requeried only the SFDoc subform and moves to the last record. Never touches the parent form. All COM errors are caught and logged."""
+def refresh_ui(expected_patient_code=None):
+    # type: (Optional[str]) -> None
+    """
+    Refreshes the parent form and requeried only the SFDoc subform, then moves
+    to the last record.
+
+    Changes vs V3:
+    - Change 7: accepts expected_patient_code; skips refresh if the currently
+      open patient no longer matches (user navigated away during a burst).
+    - Change 4: calls form.Refresh() on the parent BEFORE sfdoc.Requery() so
+      that image controls repaint without moving the record pointer.
+    - Change 5: clears form.Dirty before Requery() so Access does not silently
+      ignore it while a record is in edit mode.
+    - Change 6: wraps sfdoc.Requery() in a 3-attempt retry loop (0.5 s delay);
+      falls back to sfdoc.Refresh() if all attempts fail.
+    """
     if not WIN32_AVAILABLE:
         return
     try:
@@ -223,6 +255,17 @@ def refresh_ui():
             log.warning("Refresh skipped: no active form in Access.")
             return
 
+        # Change 7: patient code guard
+        if expected_patient_code is not None:
+            current = get_active_patient()
+            current_code = current["code"] if current else None
+            if current_code != expected_patient_code:
+                log.warning(
+                    "Refresh skipped: expected patient %s but current patient is %s.",
+                    expected_patient_code, current_code
+                )
+                return
+
         sfdoc = _find_sfdoc(form)
         if sfdoc is None:
             log.warning(
@@ -231,21 +274,53 @@ def refresh_ui():
             )
             return
 
-        # Requery the subform only
+        # Change 4: refresh parent form to repaint image controls (no record pointer move)
         try:
-            sfdoc.Requery()
-            log.info("Requery() on '%s'", SFDOC_SUBFORM_NAME)
-        except Exception as e_req:
+            form.Refresh()
+            log.info("Refresh() on parent form (image repaint).")
+        except Exception as e_pref:
+            log.warning("Parent form Refresh() failed (non-blocking): %s", e_pref)
+
+        # Change 5: dirty state guard — exit edit mode before Requery()
+        try:
+            if form.Dirty:
+                log.info("Parent form is dirty — clearing edit mode before Requery().")
+                form.Dirty = False
+        except Exception as e_dirty:
+            log.debug("Could not read/clear form.Dirty: %s", e_dirty)
+
+        # Change 6: Requery retry loop (3 attempts, 0.5 s apart; fallback to Refresh)
+        _REQUERY_ATTEMPTS = 3
+        _REQUERY_DELAY    = 0.5
+        requery_ok = False
+        for attempt in range(1, _REQUERY_ATTEMPTS + 1):
+            try:
+                sfdoc.Requery()
+                log.info(
+                    "Requery() on '%s' (attempt %d/%d).",
+                    SFDOC_SUBFORM_NAME, attempt, _REQUERY_ATTEMPTS
+                )
+                requery_ok = True
+                break
+            except Exception as e_req:
+                log.warning(
+                    "Requery() attempt %d/%d failed on '%s': %s",
+                    attempt, _REQUERY_ATTEMPTS, SFDOC_SUBFORM_NAME, e_req
+                )
+                if attempt < _REQUERY_ATTEMPTS:
+                    time.sleep(_REQUERY_DELAY)
+
+        if not requery_ok:
             log.warning(
-                "Requery() unavailable on '%s' (%s), trying Refresh()...",
-                SFDOC_SUBFORM_NAME, e_req
+                "All Requery() attempts failed on '%s', falling back to Refresh().",
+                SFDOC_SUBFORM_NAME
             )
             try:
                 sfdoc.Refresh()
-                log.info("Refresh() on '%s'", SFDOC_SUBFORM_NAME)
+                log.info("Fallback Refresh() on '%s'.", SFDOC_SUBFORM_NAME)
             except Exception as e_ref:
                 log.warning(
-                    "Refresh() also unavailable on '%s' (%s)",
+                    "Fallback Refresh() also unavailable on '%s': %s",
                     SFDOC_SUBFORM_NAME, e_ref
                 )
 
@@ -308,11 +383,15 @@ def worker(file_queue):
     Processes files from the queue. Runs the full pipeline (lock-wait →
     patient lookup → move → DB insert) for each file, then fires a single
     UI refresh once the queue has been idle for 1.5 s (burst debounce).
+
+    Change 7: tracks last_patient_code and passes it to refresh_ui() so the
+    refresh is skipped if the operator has navigated to a different patient.
     """
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    needs_refresh = False
+    needs_refresh     = False
+    last_patient_code = None   # change 7: track the patient from the last insert
 
     try:
         while True:
@@ -321,8 +400,9 @@ def worker(file_queue):
             except queue.Empty:
                 if needs_refresh:
                     log.info("Burst complete — triggering batched UI refresh.")
-                    refresh_ui()
-                    needs_refresh = False
+                    refresh_ui(expected_patient_code=last_patient_code)  # change 7
+                    needs_refresh     = False
+                    last_patient_code = None
                 continue
             except Exception as e:
                 log.error("Queue error: %s", e)
@@ -395,7 +475,8 @@ def worker(file_queue):
             description = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             if insert_document(patient, relative_path, description):
-                needs_refresh = True
+                needs_refresh     = True
+                last_patient_code = patient["code"]   # change 7
                 log.debug("Insert OK — needs_refresh=True (refresh deferred to burst end).")
             else:
                 log.warning("Insert failed, refresh flag unchanged.")
@@ -405,7 +486,7 @@ def worker(file_queue):
     finally:
         if needs_refresh:
             log.info("Worker shutting down — flushing pending UI refresh.")
-            refresh_ui()
+            refresh_ui(expected_patient_code=last_patient_code)   # change 7
         pythoncom.CoUninitialize()
 
 
@@ -427,15 +508,78 @@ class ImageProducer(FileSystemEventHandler):
         self._queue.put(file)
 
 
+class ImageProducer(FileSystemEventHandler):
+    """
+    Watchdog event handler — producer side of the producer/consumer pipeline.
+
+    Receives creation events from the PollingObserver and enqueues image files
+    on the shared queue for the worker thread.  Directory events are ignored.
+    """
+
+    def __init__(self, file_queue):
+        # type: (queue.Queue) -> None
+        super(ImageProducer, self).__init__()
+        self._queue = file_queue
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        file = Path(event.src_path)
+        if file.suffix.lower() not in WATCHED_EXTENSIONS:
+            return
+        log.info("Enqueued: %s (queue size: %d)", file.name, self._queue.qsize() + 1)
+        self._queue.put(file)
+
+
+def wait_for_network_share():
+    # type: () -> None
+    """
+    Block until SOURCE_DIR is accessible.
+
+    Returns immediately for local drive paths (identified by a colon as the
+    second character, e.g. C:\\...).  For all other paths (UNC shares, mapped
+    drives without a drive letter) the function polls is_dir() every 10 seconds
+    and logs a warning on each failed attempt.  The first successful check after
+    at least one failure also logs an info message to confirm recovery.
+    """
+    source_str = str(SOURCE_DIR)
+    is_unc    = source_str.startswith("\\\\") or source_str.startswith("//")
+    is_local  = (
+        not is_unc
+        and (len(source_str) >= 2 and source_str[1] == ":")   # e.g. C:\...
+    )
+
+    if is_local:
+        return
+
+    # Network path: poll until reachable
+    first_attempt = True
+    while True:
+        try:
+            if SOURCE_DIR.is_dir():
+                if not first_attempt:
+                    log.info("Network share is now reachable: %s", SOURCE_DIR)
+                return
+        except Exception:
+            pass
+
+        log.warning(
+            "Network share not reachable, retrying in 10 s: %s", SOURCE_DIR
+        )
+        first_attempt = False
+        time.sleep(10)
+
+
 def main():
     # type: () -> None
-    if not SOURCE_DIR.exists():
-        log.critical("Source folder not found: %s", SOURCE_DIR)
-        sys.exit(1)
+
+    # Change 2: wait for the network share before doing anything else
+    log.info("Checking network share availability...")
+    wait_for_network_share()
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Version 2 started")
+    log.info("Version 3 started")
     log.info("  Source     : %s", SOURCE_DIR)
     log.info("  Dest       : %s", DEST_PHOTOS)
     log.info("  PUBLIC.MDB : %s", PUBLIC_MDB)
@@ -452,15 +596,41 @@ def main():
     worker_thread.daemon = True
     worker_thread.start()
 
-    producer = ImageProducer(file_queue)
-    observer = Observer()
-    observer.schedule(producer, str(SOURCE_DIR), recursive=True)
-    observer.start()
-    log.info("Watching for images. Press Ctrl+C to stop.")
+    # Change 3: auto-reconnect loop — restarts the Observer if the network drops
+    _RECONNECT_DELAY = 15   # seconds to wait before restarting after a drop
+
+    def _start_observer():
+        # type: () -> Observer
+        producer = ImageProducer(file_queue)
+        obs = Observer()
+        obs.schedule(producer, str(SOURCE_DIR), recursive=True)
+        obs.start()
+        log.info("Observer started. Watching for images. Press Ctrl+C to stop.")
+        return obs
+
+    observer = _start_observer()
 
     try:
-        while observer.is_alive():
+        while True:
             time.sleep(1)
+            if not observer.is_alive():
+                log.warning(
+                    "Observer died (possible network drop). "
+                    "Waiting %d s before reconnecting...",
+                    _RECONNECT_DELAY
+                )
+                try:
+                    observer.stop()
+                    observer.join(timeout=5)
+                except Exception:
+                    pass
+
+                wait_for_network_share()          # block until share is back
+                time.sleep(_RECONNECT_DELAY)      # extra settling pause
+
+                log.info("Restarting Observer after network recovery.")
+                observer = _start_observer()
+
     except KeyboardInterrupt:
         log.info("Shutdown requested.")
     finally:

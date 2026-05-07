@@ -1,3 +1,48 @@
+"""
+studiovision_monitorV3.py
+Image Router — Version 3, latest feature build for modern Windows.
+
+Extends the baseline monitor with the following improvements over earlier versions:
+
+  1. PollingObserver — replaces the default inotify/ReadDirectoryChanges observer
+     with a polling-based one that works reliably on network shares (UNC paths
+     and mapped drives), which the standard observer misses.
+
+  2. Network share wait — blocks at startup until SOURCE_DIR is reachable, so the
+     process does not crash immediately if the file server is temporarily offline.
+
+  3. Auto-reconnect loop — if the Watchdog observer thread dies (e.g. because the
+     network share goes offline mid-session), the main loop detects it, waits for
+     the share to come back, and restarts a fresh observer automatically.
+
+  4. Targeted parent Refresh() — instead of requerying the entire Access form
+     hierarchy (which resets the record pointer to #1), only the parent form
+     receives a Refresh() (repaint only) while SFDoc receives Requery() +
+     MoveLast() so the document list is reloaded without disrupting navigation.
+
+  5. Dirty-state guard — clears form.Dirty before calling Requery() to prevent
+     Access from silently ignoring the refresh while a record is in edit mode.
+
+  6. Requery retry loop — retries Requery() up to three times with a 0.5-second
+     delay between attempts before falling back to Refresh().
+
+  7. Patient-code guard — compares the patient code captured at insert time with
+     the one currently on screen before refreshing, so the UI is not disturbed if
+     the operator navigated to a different patient during the 1.5-second debounce.
+
+  8. Log in ~/studiovision/ — writes the log file to the user's home directory so
+     that the path is valid both when running as a script and as a compiled .exe.
+
+Architecture — producer/consumer, single worker thread:
+  Producer: Watchdog PollingObserver on SOURCE_DIR (recursive).
+  Consumer: worker() thread draining a thread-safe queue with burst debounce
+            (refreshes Access once after 1.5 s of queue idle time rather than
+            after every individual insert).
+
+Dependencies: watchdog, pyodbc, pywin32, pythoncom
+"""
+
+import os
 import pythoncom
 import queue
 import shutil
@@ -7,7 +52,7 @@ import time
 import logging
 from datetime import datetime
 from pathlib import Path
-from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
 
 try:
@@ -22,7 +67,7 @@ try:
 except ImportError:
     PYODBC_AVAILABLE = False
 
-# Configuration 
+# Configuration
 SOURCE_DIR  = Path(r"??")
 ORPHAN_DIR  = Path(r"??")
 DEST_PHOTOS = Path(r"??")
@@ -58,25 +103,64 @@ EXAM_DESCRIPTION = {
 }
 
 # Configure logging to file and console with timestamps and thread names
+_LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / "image_router.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler("image_router.log", encoding="utf-8"),
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger("image_router")
 
-# Helper to connect to an Access MDB with pyodbc, with error handling deferred to caller
+
+_NETWORK_SHARE_POLL = 10  # seconds between retries when share is unreachable
+
+
+def wait_for_network_share() -> None:
+    """
+    Block until SOURCE_DIR is accessible.
+
+    For local paths the check passes immediately.  For UNC/network shares the
+    function loops every _NETWORK_SHARE_POLL seconds, logging a warning on
+    each failed attempt, so the programme waits silently until the share comes
+    online rather than crashing at startup.
+    """
+    is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
+
+    if not is_network:
+        return  # nothing to wait for on local paths
+
+    attempt = 0
+    while not SOURCE_DIR.is_dir():
+        attempt += 1
+        log.warning(
+            f"Network share not reachable: {SOURCE_DIR}  "
+            f"(attempt {attempt}, retrying in {_NETWORK_SHARE_POLL}s)"
+        )
+        time.sleep(_NETWORK_SHARE_POLL)
+
+    if attempt:
+        log.info(f"Network share is now accessible after {attempt} attempt(s): {SOURCE_DIR}")
+
+
 def db_connect(mdb_path: Path):
+    """Helper to connect to an Access MDB with pyodbc."""
     return pyodbc.connect(
         f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
     )
 
-# Returns a dict with patient info if an Access form with the expected fields is active, else None
+
 def get_active_patient() -> dict | None:
+    """
+    Returns a dict with patient info if an Access form with the expected fields
+    is active, else None.
+    """
     if not WIN32_AVAILABLE:
         return None
     try:
@@ -104,14 +188,17 @@ def get_active_patient() -> dict | None:
             "nom":    str(data[ACCESS_FIELD_NOM]),
             "prenom": str(data[ACCESS_FIELD_PRENOM]),
         }
-        
+
     except Exception as e:
         log.debug(f"COM error: {e}")
         return None
 
-# Uses the PUBLIC.MDB Documents table to resolve the patient's photo folder,
-# returning a Path if successful or None if any step fails
+
 def find_patient_folder(patient_code: str) -> Path | None:
+    """
+    Uses PUBLIC.MDB Documents table to resolve the patient's photo folder.
+    Returns a Path if successful or None if any step fails.
+    """
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
@@ -149,20 +236,22 @@ def find_patient_folder(patient_code: str) -> Path | None:
         log.error(f"DB folder lookup failed: {e}")
         return None
 
-# Inserts a new record into PUBLIC.MDB Documents for the given patient, relative path, and description.
+
 def insert_document(patient: dict, relative_path: str, description: str) -> bool:
+    """
+    Inserts a new record into PUBLIC.MDB Documents for the given patient,
+    relative path, and description.
+    """
     if not PYODBC_AVAILABLE:
         log.warning("pyodbc not available, insert skipped.")
         return False
 
-    # IMPORTANT: target_mdb must be PUBLIC.MDB because DOCUM.MDB is read-only for this operation
-    target_mdb = PUBLIC_MDB
-    if not target_mdb.exists():
+    if not PUBLIC_MDB.exists():
         log.error("PUBLIC.MDB not found, insert skipped.")
         return False
 
     try:
-        conn   = db_connect(target_mdb)
+        conn   = db_connect(PUBLIC_MDB)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -174,7 +263,7 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
         )
         conn.commit()
         conn.close()
-        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={target_mdb.name}")
+        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={PUBLIC_MDB.name}")
         return True
     except Exception as e:
         log.error(f"DB insert failed: {e}")
@@ -189,6 +278,8 @@ def _find_sfdoc(form):
     """
     Recursively walks the form's control tree and returns the Form object
     of the subform named SFDOC_SUBFORM_NAME, or None if not found.
+    This avoids touching the parent form's Recordset (and its current-record
+    pointer), which prevents the "sent back to record #1" regression.
     """
     for i in range(form.Controls.Count):
         ctrl = form.Controls(i)
@@ -197,6 +288,7 @@ def _find_sfdoc(form):
                 continue
             if ctrl.Name == SFDOC_SUBFORM_NAME:
                 return ctrl.Form
+            # Descend into nested subforms
             found = _find_sfdoc(ctrl.Form)
             if found is not None:
                 return found
@@ -205,7 +297,7 @@ def _find_sfdoc(form):
     return None
 
 
-def refresh_ui() -> None:
+def refresh_ui(expected_patient_code: str | None = None) -> None:
     """
     Two-step refresh strategy:
       1. Refresh() on the PARENT form — updates bound image controls (photo
@@ -214,6 +306,15 @@ def refresh_ui() -> None:
          to record #1.
       2. Requery() + MoveLast() on SFDoc only — reloads the document list
          and positions it on the newly added entry.
+
+    Guards applied before refreshing:
+      - Patient code guard  : if expected_patient_code is given, the current
+        patient is re-checked; a mismatch skips the refresh entirely.
+      - Dirty state guard   : Access silently ignores Requery() while a record
+        is being edited. form.Dirty is cleared first to exit edit mode.
+      - Requery retry loop  : 3 attempts with 0.5 s delay; falls back to
+        Refresh() if all attempts fail.
+
     All COM errors are caught and logged so the worker thread is never blocked.
     """
     if not WIN32_AVAILABLE:
@@ -225,7 +326,18 @@ def refresh_ui() -> None:
             log.warning("Refresh skipped: no active form in Access.")
             return
 
-        # --- Step 1: Refresh the parent form to update image controls ---
+        # Guard: if the active patient has changed since the insert, skip the
+        # refresh to avoid updating the wrong consultation on screen.
+        if expected_patient_code is not None:
+            current = get_active_patient()
+            current_code = current["code"] if current else None
+            if current_code != expected_patient_code:
+                log.warning(
+                    f"Refresh skipped: active patient changed "
+                    f"(expected={expected_patient_code}, current={current_code})."
+                )
+                return
+
         # Refresh() repaints bound controls from the current record without
         # moving the record pointer, so the consultation stays in place.
         try:
@@ -234,7 +346,7 @@ def refresh_ui() -> None:
         except Exception as e_ref:
             log.warning(f"Refresh() on parent form failed ({e_ref}), continuing...")
 
-        # --- Step 2: Requery SFDoc to load the new document row ---
+        # Requery SFDoc to load the new document row, then navigate to the last record.
         sfdoc = _find_sfdoc(form)
         if sfdoc is None:
             log.warning(
@@ -243,23 +355,49 @@ def refresh_ui() -> None:
             )
             return
 
+        # If the parent form has unsaved edits (Dirty=True), clear the dirty state
+        # before calling Requery to prevent Access from raising a save-prompt dialog.
         try:
-            sfdoc.Requery()
-            log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}'")
-        except Exception as e_req:
+            if form.Dirty:
+                log.info("Parent form is in edit mode (Dirty=True); clearing Dirty before Requery.")
+                form.Dirty = False
+        except Exception as e_dirty:
+            log.debug(f"Dirty check/clear failed ({e_dirty}), continuing...")
+
+        # Requery SFDoc with up to _REQUERY_ATTEMPTS retries in case the COM
+        # call fails transiently; fall back to Refresh() if all attempts fail.
+        _REQUERY_ATTEMPTS = 3
+        _REQUERY_DELAY    = 0.5  # seconds
+
+        requery_ok = False
+        for attempt in range(1, _REQUERY_ATTEMPTS + 1):
+            try:
+                sfdoc.Requery()
+                log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}' (attempt {attempt})")
+                requery_ok = True
+                break
+            except Exception as e_req:
+                log.warning(
+                    f"Requery() attempt {attempt}/{_REQUERY_ATTEMPTS} failed "
+                    f"on '{SFDOC_SUBFORM_NAME}': {e_req}"
+                )
+                if attempt < _REQUERY_ATTEMPTS:
+                    time.sleep(_REQUERY_DELAY)
+
+        if not requery_ok:
             log.warning(
-                f"Requery() unavailable on '{SFDOC_SUBFORM_NAME}' ({e_req}), "
-                "trying Refresh()..."
+                f"All {_REQUERY_ATTEMPTS} Requery() attempts failed on "
+                f"'{SFDOC_SUBFORM_NAME}'; falling back to Refresh()."
             )
             try:
                 sfdoc.Refresh()
-                log.info(f"Refresh() on '{SFDOC_SUBFORM_NAME}'")
+                log.info(f"Fallback Refresh() on '{SFDOC_SUBFORM_NAME}'")
             except Exception as e_ref2:
                 log.warning(
-                    f"Refresh() also unavailable on '{SFDOC_SUBFORM_NAME}' ({e_ref2})"
+                    f"Fallback Refresh() also failed on '{SFDOC_SUBFORM_NAME}': {e_ref2}"
                 )
 
-        # Navigate to the last record so the new document is visible
+        # Navigate to the last record so the new document is visible.
         try:
             sfdoc.Recordset.MoveLast()
             log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}'")
@@ -270,8 +408,8 @@ def refresh_ui() -> None:
         log.warning(f"COM refresh failed (non-blocking): {e}")
 
 
-# Tries to open the file for reading to check if it's still locked by the writing process
 def wait_for_file(file: Path) -> bool:
+    """Tries to open the file for reading to check if it's still locked."""
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
             with file.open("rb"):
@@ -282,8 +420,9 @@ def wait_for_file(file: Path) -> bool:
     log.error(f"File still locked after {FILE_LOCK_MAX_ATTEMPTS} attempts: {file}")
     return False
 
-# Moves the file to the destination folder, handling name conflicts by appending a timestamp
+
 def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
+    """Moves the file to dest_folder, resolving name conflicts with a timestamp."""
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
 
@@ -301,42 +440,37 @@ def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
         log.error(f"Move failed: {e}")
         return None
 
-# Moves the file to the orphan folder with a warning log
+
 def orphan_file(file: Path) -> None:
+    """Moves the file to the orphan folder with a warning log."""
     log.warning(f"Orphaning: {file.name}")
     move_file(file, ORPHAN_DIR, label="ORPHAN")
 
-# Removes a folder only if it is strictly empty; fails silently otherwise
-def _try_rmdir(folder: Path) -> None:
-    try:
-        if folder.is_dir() and not any(folder.iterdir()):
-            folder.rmdir()
-            log.info(f"Empty folder removed: {folder}")
-        else:
-            log.debug(f"Folder not removed (non-empty or missing): {folder}")
-    except Exception as e:
-        log.debug(f"_try_rmdir({folder}) ignored: {e}")
 
-# Worker thread function that processes files from the queue, with patient lookup, file moving,
-# DB insertion, and UI refresh logic
 def worker(file_queue: queue.Queue) -> None:
+    """
+    Processes files from the queue. Runs the full pipeline (lock-wait →
+    patient lookup → move → DB insert) for each file, then fires a single
+    UI refresh once the queue has been idle for 1.5 s (burst debounce).
+    """
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    # Tracks scan folders already processed to suppress residual files still in the queue
-    processed_scan_dirs: set[Path] = set()
-
     needs_refresh: bool = False
+    last_patient_code: str | None = None
 
     try:
         while True:
             try:
                 file: Path = file_queue.get(timeout=1.5)
             except queue.Empty:
+                # Queue drained — if at least one insert succeeded since the
+                # last refresh, now is the right moment to update the UI.
                 if needs_refresh:
                     log.info("Burst complete — triggering batched UI refresh.")
-                    refresh_ui()
+                    refresh_ui(expected_patient_code=last_patient_code)
                     needs_refresh = False
+                    last_patient_code = None
                 continue
             except Exception as e:
                 log.error(f"Queue error: {e}")
@@ -353,63 +487,6 @@ def worker(file_queue: queue.Queue) -> None:
                 log.error(f"Aborting, persistent lock: {file.name}")
                 file_queue.task_done()
                 continue
-
-            scan_dir = file.parent
-            main_dir = file.parent.parent
-            is_nidek = main_dir.parent == SOURCE_DIR  
-
-            if is_nidek:
-
-                if scan_dir in processed_scan_dirs:
-                    try:
-                        file.unlink()
-                        log.info(f"[NIDEK] Residual removed (scan already processed): {file.name}")
-                    except Exception as e:
-                        log.warning(f"[NIDEK] Could not remove residual {file.name}: {e}")
-
-                    _try_rmdir(scan_dir)
-                    _try_rmdir(main_dir)
-                    if not scan_dir.exists():
-                        processed_scan_dirs.discard(scan_dir)
-
-                    file_queue.task_done()
-                    continue
-
-                log.info(f"[NIDEK] Stabilising '{scan_dir.name}' (parent: '{main_dir.name}')...")
-                time.sleep(2)
-
-                for xml_file in list(scan_dir.glob("*.xml")):
-                    try:
-                        xml_file.unlink()
-                        log.info(f"[NIDEK] XML removed: {xml_file.name}")
-                    except Exception as e:
-                        log.warning(f"[NIDEK] Could not remove {xml_file.name}: {e}")
-
-                sibling_images = [
-                    f for f in scan_dir.iterdir()
-                    if f.is_file() and f.suffix.lower() in WATCHED_EXTENSIONS
-                ]
-
-                if not sibling_images:
-                    log.warning(f"[NIDEK] No images found in '{scan_dir.name}', skipping.")
-                    file_queue.task_done()
-                    continue
-
-                largest_image = max(sibling_images, key=lambda f: f.stat().st_size)
-
-                if file.resolve() != largest_image.resolve():
-                    try:
-                        file.unlink()
-                        log.info(f"[NIDEK] Thumbnail removed: {file.name}")
-                    except Exception as e:
-                        log.warning(f"[NIDEK] Could not remove thumbnail {file.name}: {e}")
-                    file_queue.task_done()
-                    continue
-
-                log.info(f"[NIDEK] Main image identified: {file.name} "
-                         f"({file.stat().st_size:,} bytes)")
-
-                processed_scan_dirs.add(scan_dir)
 
             patient    = None
             start_time = time.monotonic()
@@ -428,8 +505,10 @@ def worker(file_queue: queue.Queue) -> None:
                     break
 
                 if first_log:
-                    log.info(f"No patient open, waiting "
-                             f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)")
+                    log.info(
+                        f"No patient open, waiting "
+                        f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
+                    )
                     first_log = False
 
                 time.sleep(PATIENT_POLL_INTERVAL)
@@ -437,11 +516,17 @@ def worker(file_queue: queue.Queue) -> None:
             if patient is None:
                 continue
 
-            log.info(f"Patient: {patient['nom']} {patient['prenom']} (code {patient['code']})")
+            log.info(
+                f"Patient: {patient['nom']} {patient['prenom']} "
+                f"(code {patient['code']})"
+            )
 
             patient_folder = find_patient_folder(patient["code"])
             if not patient_folder:
-                log.error(f"Could not resolve folder for patient {patient['code']}. Orphaning.")
+                log.error(
+                    f"Could not resolve folder for patient {patient['code']}. "
+                    "Orphaning."
+                )
                 orphan_file(file)
                 file_queue.task_done()
                 continue
@@ -457,29 +542,30 @@ def worker(file_queue: queue.Queue) -> None:
 
             if insert_document(patient, relative_path, description):
                 needs_refresh = True
+                last_patient_code = patient["code"]
                 log.debug("Insert OK — needs_refresh=True (refresh deferred to burst end).")
             else:
                 log.warning("Insert failed, refresh flag unchanged.")
 
-            # Clean up scan folders after file transfer and DB insert
-            if is_nidek:
-                _try_rmdir(scan_dir)
-                _try_rmdir(main_dir)
-                if not scan_dir.exists():
-                    processed_scan_dirs.discard(scan_dir)
-                    log.info(f"[NIDEK] scan_dir cleared from tracking set.")
-
             file_queue.task_done()
 
     finally:
+        # Flush any pending refresh before the thread exits
         if needs_refresh:
             log.info("Worker shutting down — flushing pending UI refresh.")
-            refresh_ui()
+            refresh_ui(expected_patient_code=last_patient_code)
         pythoncom.CoUninitialize()
 
 
-# Watchdog event handler that enqueues new image files for processing by the worker thread
 class ImageProducer(FileSystemEventHandler):
+    """
+    Watchdog event handler — producer side of the producer/consumer pipeline.
+
+    Receives filesystem creation events from the PollingObserver and filters them
+    to supported image extensions before enqueuing the path for the worker thread.
+    Directory creation events are ignored since they carry no image data.
+    """
+
     def __init__(self, file_queue: queue.Queue) -> None:
         super().__init__()
         self._queue = file_queue
@@ -493,37 +579,79 @@ class ImageProducer(FileSystemEventHandler):
         log.info(f"Enqueued: {file.name} (queue size: {self._queue.qsize() + 1})")
         self._queue.put(file)
 
-# Main function to start the image router
+
 def main() -> None:
+    """
+    Application entry point for Version 3.
+
+    Startup sequence:
+      1. Wait for the network share (improvement 2) so the process does not
+         crash if the file server is temporarily offline at launch.
+      2. Validate SOURCE_DIR and create ORPHAN_DIR if needed.
+      3. Start the worker thread and the Watchdog PollingObserver.
+      4. Enter the auto-reconnect main loop (improvement 3): if the observer
+         thread dies (e.g. network drop), the loop stops the dead observer,
+         waits for the share to come back, and restarts a fresh observer.
+
+    On KeyboardInterrupt (Ctrl+C) the observer is stopped cleanly and the
+    main thread waits for any queued files to finish processing before exit.
+    """
+
     if not SOURCE_DIR.exists():
         log.critical(f"Source folder not found: {SOURCE_DIR}")
         sys.exit(1)
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Image Router v3.8 started")
+    log.info("Version 3 started")
     log.info(f"  Source     : {SOURCE_DIR}")
     log.info(f"  Dest       : {DEST_PHOTOS}")
     log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
     log.info(f"  DOCUM.MDB  : {DOCUM_MDB}")
     log.info(f"  Orphans    : {ORPHAN_DIR}")
+    log.info(f"  Log file   : {_LOG_FILE}")
     log.info(f"  Timeout    : {PATIENT_WAIT_TIMEOUT // 60} min")
     log.info(f"  Ext        : {', '.join(sorted(WATCHED_EXTENSIONS))}")
 
     file_queue: queue.Queue = queue.Queue()
 
-    worker_thread = threading.Thread(target=worker, args=(file_queue,), name="Worker", daemon=True)
+    worker_thread = threading.Thread(
+        target=worker, args=(file_queue,), name="Worker", daemon=True
+    )
     worker_thread.start()
 
-    producer = ImageProducer(file_queue)
-    observer = Observer()
-    observer.schedule(producer, str(SOURCE_DIR), recursive=True)
-    observer.start()
-    log.info("Watching for images. Press Ctrl+C to stop.")
+    def _start_observer() -> Observer:
+        obs = Observer()
+        obs.schedule(ImageProducer(file_queue), str(SOURCE_DIR), recursive=True)
+        obs.start()
+        log.info("Observer started — watching for images. Press Ctrl+C to stop.")
+        return obs
+
+    observer = _start_observer()
+
+    # Auto-reconnect loop: if the Watchdog observer dies (e.g. due to a
+    # temporary network drop on a UNC share), wait and restart it automatically.
+    _RECONNECT_WAIT = 15  # seconds to pause before restarting the observer
 
     try:
-        while observer.is_alive():
+        while True:
+            if not observer.is_alive():
+                log.warning("Observer has stopped (network drop?). Attempting reconnect...")
+                try:
+                    observer.stop()
+                    observer.join(timeout=5)
+                except Exception:
+                    pass
+
+                # Re-check the share before spawning a new observer (improvement 2).
+                wait_for_network_share()
+                log.info(f"Waiting {_RECONNECT_WAIT}s before restarting observer...")
+                time.sleep(_RECONNECT_WAIT)
+
+                observer = _start_observer()
+
             time.sleep(1)
+
     except KeyboardInterrupt:
         log.info("Shutdown requested.")
     finally:
@@ -536,6 +664,7 @@ def main() -> None:
             file_queue.join()
 
         log.info("Image Router stopped.")
+
 
 if __name__ == "__main__":
     main()

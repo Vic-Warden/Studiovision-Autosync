@@ -1,3 +1,30 @@
+"""
+studiovision_monitorV2.py
+Image Router — Version 2.
+
+Introduces the following improvements over the Version 1 baseline:
+
+  1. Burst debounce — instead of calling Access COM immediately after each
+     successful DB insert, the worker raises a needs_refresh flag and defers
+     the refresh until the queue has been idle for 1.5 seconds.  This reduces
+     COM round-trips during rapid multi-file acquisitions and avoids freezing
+     the Access UI between consecutive inserts.
+
+  2. Targeted SFDoc-only refresh — instead of requerying the entire parent
+     form (which resets its record pointer to #1), the function now locates
+     the SFDoc subform directly via _find_sfdoc() and calls Requery() only on
+     it, followed by MoveLast() to position the cursor on the new document.
+
+  3. Log file in ~/studiovision/ — ensures the log path is valid both when the
+     script is run directly and when distributed as a compiled executable.
+
+Architecture is the same producer/consumer single-worker-thread design as the
+baseline, using the standard Watchdog Observer (not polling-based, so suited
+for local or already-connected network drives only).
+
+Dependencies: watchdog, pyodbc, pywin32, pythoncom
+"""
+
 import pythoncom
 import queue
 import shutil
@@ -242,7 +269,7 @@ def refresh_ui() -> None:
             )
             return
 
-        # --- Requery the subform only ---
+        # Requery the subform only, leaving the parent form's record pointer unchanged.
         try:
             sfdoc.Requery()
             log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}'")
@@ -259,7 +286,7 @@ def refresh_ui() -> None:
                     f"Refresh() also unavailable on '{SFDOC_SUBFORM_NAME}' ({e_ref})"
                 )
 
-        # --- Navigate to the last record so the new document is visible ---
+        # Navigate to the last record so the new document is visible.
         try:
             sfdoc.Recordset.MoveLast()
             log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}'")
@@ -311,9 +338,28 @@ def orphan_file(file: Path) -> None:
 
 def worker(file_queue: queue.Queue) -> None:
     """
-    Processes files from the queue. Runs the full pipeline (lock-wait →
-    patient lookup → move → DB insert) for each file, then fires a single
-    UI refresh once the queue has been idle for 1.5 s (burst debounce).
+    Long-running consumer thread that drains the shared queue and processes
+    each image through the complete pipeline.
+
+    COM is initialised per-thread via CoInitialize()/CoUninitialize().
+
+    Burst debounce (improvement 1): the worker uses a 1.5-second blocking
+    get() timeout.  While files arrive faster than that interval it processes
+    them back-to-back with needs_refresh=True.  Once the queue is idle for
+    1.5 seconds (burst end), a single UI refresh is fired rather than one
+    after every individual insert, avoiding repeated Access COM round-trips.
+
+    Processing pipeline per file:
+      1. Existence check — the file may be deleted before the worker dequeues it.
+      2. Lock-wait — polls until the file is fully written (see wait_for_file).
+      3. Patient identification loop — polls the active Access form until a
+         patient is found or PATIENT_WAIT_TIMEOUT elapses; orphans on timeout.
+      4. Folder resolution — queries PUBLIC.MDB for the patient's directory.
+      5. File move — transfers the image into the patient folder.
+      6. DB insert — registers the image in the Documents table.
+      7. Burst flag — sets needs_refresh=True for the deferred UI update.
+
+    On shutdown any pending refresh is flushed in the finally block.
     """
     pythoncom.CoInitialize()
     log.info("Worker started.")
@@ -325,8 +371,8 @@ def worker(file_queue: queue.Queue) -> None:
             try:
                 file: Path = file_queue.get(timeout=1.5)
             except queue.Empty:
-                # Queue drained — if at least one insert succeeded since the
-                # last refresh, now is the right moment to update the UI.
+                # Queue has been idle for 1.5 s — the burst is over.  Fire the
+                # deferred refresh exactly once rather than after every insert.
                 if needs_refresh:
                     log.info("Burst complete — triggering batched UI refresh.")
                     refresh_ui()
@@ -401,8 +447,9 @@ def worker(file_queue: queue.Queue) -> None:
             description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             if insert_document(patient, relative_path, description):
-                # Raise the flag — the refresh will fire once the burst ends,
-                # NOT right now (avoids freezing Access on rapid sequences).
+                # Raise the burst flag — the refresh fires once the queue is
+                # idle, not immediately, to avoid freezing Access on rapid
+                # sequential inserts.
                 needs_refresh = True
                 log.debug("Insert OK — needs_refresh=True (refresh deferred to burst end).")
             else:

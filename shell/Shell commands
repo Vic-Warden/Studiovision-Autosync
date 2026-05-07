@@ -48,3 +48,12 @@ $shortcut = $shell.CreateShortcut("$startup\windows7.lnk")
 $shortcut.TargetPath = $exe
 $shortcut.WorkingDirectory = "C:\Users\Optovue User\Desktop\NouveauDossier\dist"
 $shortcut.Save()
+
+# Create a scheduled task for box1
+
+schtasks /create /tn "box1" /tr "C:\Scripts\box1.exe" /sc onlogon /delay 0001:30 /rl highest /ru SYSTEM /f
+
+# Disable sleep, monitor off, and hibernate on AC power
+powercfg /change standby-timeout-ac 0
+powercfg /change monitor-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0

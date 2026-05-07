@@ -49,6 +49,7 @@ import shutil
 import sys
 import threading
 import time
+import ctypes
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -580,6 +581,18 @@ class ImageProducer(FileSystemEventHandler):
         self._queue.put(file)
 
 
+def prevent_sleep() -> None:
+    """Prevent Windows from sleeping or turning off the display while the program runs."""
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 |  # ES_CONTINUOUS
+            0x00000001    # ES_SYSTEM_REQUIRED
+        )
+        log.info("Sleep prevention active.")
+    except Exception as e:
+        log.warning(f"Could not set execution state: {e}")
+
+
 def main() -> None:
     """
     Application entry point for Version 3.
@@ -596,6 +609,8 @@ def main() -> None:
     On KeyboardInterrupt (Ctrl+C) the observer is stopped cleanly and the
     main thread waits for any queued files to finish processing before exit.
     """
+
+    prevent_sleep()
 
     if not SOURCE_DIR.exists():
         log.critical(f"Source folder not found: {SOURCE_DIR}")

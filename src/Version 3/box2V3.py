@@ -39,6 +39,7 @@ import shutil
 import sys
 import threading
 import time
+import ctypes
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -707,6 +708,18 @@ def clear_source_dir() -> None:
     log.info("Source directory cleared.")
 
 
+def prevent_sleep() -> None:
+    """Prevent Windows from sleeping or turning off the display while the program runs."""
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 |  # ES_CONTINUOUS
+            0x00000001    # ES_SYSTEM_REQUIRED
+        )
+        log.info("Sleep prevention active.")
+    except Exception as e:
+        log.warning(f"Could not set execution state: {e}")
+
+
 def main() -> None:
     """
     Application entry point for Box 2, Version 3.
@@ -721,6 +734,7 @@ def main() -> None:
     On KeyboardInterrupt the observer is stopped first; the main thread then
     waits for the queue to drain so no in-flight file is abandoned.
     """
+    prevent_sleep()
     # Wait for the network share before doing anything else.
     wait_for_network_share()
 

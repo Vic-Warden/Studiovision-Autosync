@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import logging
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -570,9 +571,22 @@ def wait_for_network_share():
         time.sleep(10)
 
 
+def prevent_sleep() -> None:
+    """Prevent Windows from sleeping or turning off the display while the program runs."""
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 |  # ES_CONTINUOUS
+            0x00000001    # ES_SYSTEM_REQUIRED
+        )
+        log.info("Sleep prevention active.")
+    except Exception as e:
+        log.warning(f"Could not set execution state: {e}")
+
+
 def main():
     # type: () -> None
 
+    prevent_sleep()
     # Change 2: wait for the network share before doing anything else
     log.info("Checking network share availability...")
     wait_for_network_share()

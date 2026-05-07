@@ -33,6 +33,7 @@ import shutil
 import sys
 import threading
 import time
+import ctypes
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -669,6 +670,18 @@ def wait_for_network_share() -> None:
         time.sleep(10)
 
 
+def prevent_sleep() -> None:
+    """Prevent Windows from sleeping or turning off the display while the program runs."""
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 |  # ES_CONTINUOUS
+            0x00000001    # ES_SYSTEM_REQUIRED
+        )
+        log.info("Sleep prevention active.")
+    except Exception as e:
+        log.warning(f"Could not set execution state: {e}")
+
+
 def main() -> None:
     """
     Application entry point for Box 1, Version 3.
@@ -686,6 +699,7 @@ def main() -> None:
     enqueues, then the main thread waits for the queue to drain completely so
     no in-flight file is abandoned mid-pipeline.
     """
+    prevent_sleep()
     # Network share check before doing anything else.
     log.info("Checking network share availability...")
     wait_for_network_share()

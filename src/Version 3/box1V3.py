@@ -599,23 +599,6 @@ def worker(file_queue: queue.Queue) -> None:
 
 
 class ImageProducer(FileSystemEventHandler):
-    """Watchdog event handler that enqueues new image files for the worker."""
-
-    def __init__(self, file_queue: queue.Queue) -> None:
-        super().__init__()
-        self._queue = file_queue
-
-    def on_created(self, event) -> None:
-        if event.is_directory:
-            return
-        file = Path(event.src_path)
-        if file.suffix.lower() not in WATCHED_EXTENSIONS:
-            return
-        log.info(f"Enqueued: {file.name} (queue size: {self._queue.qsize() + 1})")
-        self._queue.put(file)
-
-
-class ImageProducer(FileSystemEventHandler):
     """
     Watchdog event handler — producer side of the producer/consumer pipeline.
 

@@ -1,25 +1,25 @@
-# cmd
+:: cmd
 taskkill /f /im NOM_DU_PROGRAMME.exe /t
 schtasks /delete /tn "NOM_TACHE" /f
 del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\NOM_DU_PROGRAMME.lnk"
 
+:: cmd 
 cd C:\CHEMIN\VERS\TON\DOSSIER
-pyinstaller --onefile --noconsole --name NOM_DU_PROGRAMME NOM_DU_SCRIPT.py
+pyinstaller --onefile --noconsole --collect-all pystray --collect-all PIL --name NOM_DU_PROGRAMME NOM_DU_SCRIPT.py
 
-# powershell
-$exe = "C:\CHEMIN\VERS\dist\NOM_DU_PROGRAMME.exe"
-$startup = [System.Environment]::GetFolderPath("Startup")
+:: powershell 
+$exe = "C:\CHEMIN\VERS\TON\DOSSIER\dist\NOM_DU_PROGRAMME.exe"
+$desktop = [System.Environment]::GetFolderPath("Desktop")
 $shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut("$startup\NOM_DU_PROGRAMME.lnk")
+$shortcut = $shell.CreateShortcut("$desktop\NOM_DU_PROGRAMME.lnk")
 $shortcut.TargetPath = $exe
-$shortcut.WorkingDirectory = "C:\CHEMIN\VERS\dist"
+$shortcut.WorkingDirectory = "C:\CHEMIN\VERS\TON\DOSSIER\dist"
+$shortcut.Description = "Lancer le routeur d'images médicales"
 $shortcut.Save()
 
-# cmd
-schtasks /create /tn "NOM_TACHE" /tr "C:\CHEMIN\VERS\dist\NOM_DU_PROGRAMME.exe" /sc onlogon /delay 0001:30 /rl highest /ru SYSTEM /f
+:: cmd
 powercfg /change standby-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 
-schtasks /query /tn "NOM_TACHE"
-dir "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+dir "%USERPROFILE%\Desktop\NOM_DU_PROGRAMME.lnk"

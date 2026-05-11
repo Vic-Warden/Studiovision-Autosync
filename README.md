@@ -14,13 +14,17 @@ Several variants are provided in `src/`. They share the same core logic and conf
 | `studiovision_monitor.py` | `src/` | Base version. Watches a flat source folder for new images. |
 | `windows7.py` | `src/` | Same as above, using `typing.Optional` for Python 3.9 / Windows 7 compatibility. |
 | `box2.py` | `src/` | Extended version with **Nidek device support**. |
-| `studiovision_monitorV2.py` | `src/Vesion 2/` | Improved base version with **batched UI refresh** and **SFDoc-only requery**. |
-| `windows7V2.py` | `src/Vesion 2/` | V2 improvements ported to Python 3.9 / Windows 7 compatible syntax. |
-| `box2V2.py` | `src/Vesion 2/` | Nidek support + V2 improvements (batched refresh, SFDoc-only requery). |
-| `studiovision_monitorV3.py` | `src/Version 3/` | **Latest.** Base version with all V3 improvements. |
-| `windows7V3.py` | `src/Version 3/` | **Latest.** Python 3.9 / Windows 7 compatible, V3 improvements. |
-| `box1V3.py` | `src/Version 3/` | **Latest.** Standard device (Box 1) with all V3 improvements. |
-| `box2V3.py` | `src/Version 3/` | **Latest.** Nidek OCT device (Box 2) + all V3 improvements. |
+| `studiovision_monitorV2.py` | `src/Version 2/` | Improved base version with **batched UI refresh** and **SFDoc-only requery**. |
+| `windows7V2.py` | `src/Version 2/` | V2 improvements ported to Python 3.9 / Windows 7 compatible syntax. |
+| `box2V2.py` | `src/Version 2/` | Nidek support + V2 improvements (batched refresh, SFDoc-only requery). |
+| `studiovision_monitorV3.py` | `src/Version 3/` | Base version with all V3 improvements. |
+| `windows7V3.py` | `src/Version 3/` | Python 3.9 / Windows 7 compatible, V3 improvements. |
+| `box1V3.py` | `src/Version 3/` | Standard device (Box 1) with all V3 improvements. |
+| `box2V3.py` | `src/Version 3/` | Nidek OCT device (Box 2) + all V3 improvements. |
+| `studiovision_monitorV4.py` | `src/Version 4/` | **Latest.** Base version with all V4 improvements (system tray, notifications). |
+| `windows7V4.py` | `src/Version 4/` | **Latest.** Python 3.9 / Windows 7 compatible, V4 improvements. |
+| `box1V4.py` | `src/Version 4/` | **Latest.** Standard device (Box 1) with all V4 improvements. |
+| `box2V4.py` | `src/Version 4/` | **Latest.** Nidek OCT device (Box 2) + all V4 improvements. |
 
 ---
 
@@ -38,7 +42,7 @@ Several variants are provided in `src/`. They share the same core logic and conf
 
 ---
 
-## Nidek device support (`box2.py`, `box2V2.py`, `box2V3.py`)
+## Nidek device support (`box2.py`, `box2V2.py`, `box2V3.py`, `box2V4.py`)
 
 Nidek devices save scans as a set of files inside a sub-folder (`SOURCE_DIR/<device>/<scan>/`). The box2 variants handle this layout:
 
@@ -52,24 +56,42 @@ Files not inside a Nidek sub-folder are processed normally (same as the base ver
 
 ---
 
+## Version 4 improvements (`src/Version 4/`)
+
+All four V4 scripts (`studiovision_monitorV4.py`, `windows7V4.py`, `box1V4.py`, `box2V4.py`) are the latest iteration and include all V3 improvements plus the following:
+
+### System tray icon
+A persistent icon appears in the Windows notification area (pystray + Pillow):
+- **Blue** when idle and ready.
+- **Green** while a file transfer is in progress.
+- Right-click menu provides a read-only status label, an "Open logs" action, and a "Quit" action.
+
+### Windows toast notifications
+Non-blocking toast notifications (~3 seconds) are shown at key events:
+- When a transfer starts (first file of a burst).
+- When a burst completes, with a count of files processed.
+- On errors (file locked, DB insert failure, orphan file).
+
+---
+
 ## Version 3 improvements (`src/Version 3/`)
 
 All four V3 scripts (`studiovision_monitorV3.py`, `windows7V3.py`, `box1V3.py`, `box2V3.py`) are the latest iteration and include all previous improvements plus the following:
 
 ### Network share wait
-At startup, the script blocks until `SOURCE_DIR` is accessible. For UNC/network paths (`\\server\share`), it retries every 10 seconds and logs a warning on each failed attempt, so the program waits silently rather than crashing if the share is temporarily unreachable.
+At startup, the script blocks until `SOURCE_DIR` is accessible. For UNC/network paths (`\\server\share`), it retries every 10 seconds and logs a warning on each failed attempt.
 
 ### Auto-reconnect observer loop
-The main loop monitors the Watchdog observer. If it dies (e.g. due to a temporary network drop), the script automatically stops the old observer, waits for the share to come back, and restarts a fresh observer — no manual restart required.
+The main loop monitors the Watchdog observer. If it dies (e.g. due to a temporary network drop), the script automatically stops the old observer, waits for the share to come back, and restarts a fresh observer.
 
 ### Source directory cleanup at startup
-`clear_source_dir()` is called once after the network share is confirmed reachable. It deletes all files and sub-folders left over in `SOURCE_DIR` from a previous session, ensuring a clean slate.
+`clear_source_dir()` is called once after the network share is confirmed reachable. It deletes all files and sub-folders left over in `SOURCE_DIR` from a previous session.
 
 ### Sleep prevention
 `prevent_sleep()` calls `SetThreadExecutionState` to prevent Windows from sleeping or turning off the display while the script is running.
 
 ### Burst debounce with patient-code guard
-UI refresh is deferred until the queue has been idle for **1.5 seconds**, reducing the number of COM calls during rapid multi-file acquisitions. The patient code captured at insert time is compared against the active patient at refresh time — if the operator navigated away during the burst, the refresh is skipped to avoid updating the wrong record.
+UI refresh is deferred until the queue has been idle for **1.5 seconds**, reducing the number of COM calls during rapid multi-file acquisitions. The patient code captured at insert time is compared against the active patient at refresh time — if the operator navigated away during the burst, the refresh is skipped.
 
 ### Dirty-state guard
 Before calling `Requery()` on the SFDoc subform, the script checks `form.Dirty`. If the parent form is in edit mode, it clears `Dirty` first to prevent Access from raising a save-prompt dialog.
@@ -78,10 +100,10 @@ Before calling `Requery()` on the SFDoc subform, the script checks `form.Dirty`.
 `Requery()` on `SFDoc` is retried up to 3 times (0.5 s between attempts) before falling back to `Refresh()`.
 
 ### Centralized log file
-Logs are now written to `~/studiovision/image_router.log` (the `studiovision` folder in the user's home directory) instead of the working directory, making them easier to find on deployment machines.
+Logs are written to `~/studiovision/image_router.log` (the `studiovision` folder in the user's home directory).
 
 ### Document file support
-The watched extensions and `EXAM_DESCRIPTION` mapping now include document formats:
+The watched extensions and `EXAM_DESCRIPTION` mapping include document formats:
 
 | Extension | Description inserted |
 |---|---|
@@ -95,8 +117,9 @@ The watched extensions and `EXAM_DESCRIPTION` mapping now include document forma
 ## Requirements
 
 - **Windows only** — requires `win32com` (COM automation) and `pyodbc` (Access ODBC driver).
-- Python 3.10+ (`studiovision_monitor.py`, `box2.py`, `box2V2.py`, `box2V3.py`) or Python 3.9+ (`windows7.py`, `windows7V2.py`).
+- Python 3.10+ (all scripts except `windows7*.py`) or Python 3.9+ (`windows7.py`, `windows7V2.py`, `windows7V3.py`, `windows7V4.py`).
 - Microsoft Access ODBC driver installed on the machine.
+- `pystray` and `Pillow` for the system tray icon (V4 only — the script falls back to headless mode if unavailable).
 
 ```bash
 pip install -r requirements.txt
@@ -107,6 +130,8 @@ pip install -r requirements.txt
 | `watchdog` | File system monitoring |
 | `pyodbc` | Access database connection via ODBC |
 | `pywin32` | COM automation for interacting with Access |
+| `pystray` | System tray icon (V4) |
+| `Pillow` | Icon image generation (V4) |
 
 ---
 
@@ -140,8 +165,6 @@ The following file extensions are monitored by default:
 
 `.jpg`, `.jpeg`, `.jfif`, `.png`, `.bmp`, `.tif`, `.tiff`, `.dcm`, `.pdf`, `.rtf`, `.doc`, `.docx`, `.odt`
 
-> **Note:** document extensions (`.pdf`, `.rtf`, `.doc`, `.docx`, `.odt`) are only present in `box2V3.py`. Earlier versions watch image extensions only.
-
 To add or remove extensions, edit `WATCHED_EXTENSIONS` and update `EXAM_DESCRIPTION` accordingly.
 
 ---
@@ -149,25 +172,31 @@ To add or remove extensions, edit `WATCHED_EXTENSIONS` and update `EXAM_DESCRIPT
 ## Running
 
 ```bash
-# Version 3 — recommended
-python "src/Version 3/box2V3.py"           # Nidek OCT device (Box 2) + all V3 improvements
-python "src/Version 3/box1V3.py"           # Standard device (Box 1) + all V3 improvements
-python "src/Version 3/studiovision_monitorV3.py"  # Base version with V3 improvements
-python "src/Version 3/windows7V3.py"       # Python 3.9 / Windows 7 compatible, V3 improvements
+# Version 4 — recommended
+python "src/Version 4/box2V4.py"                    # Nidek OCT device (Box 2) + all V4 improvements
+python "src/Version 4/box1V4.py"                    # Standard device (Box 1) + all V4 improvements
+python "src/Version 4/studiovision_monitorV4.py"    # Base version with V4 improvements
+python "src/Version 4/windows7V4.py"                # Python 3.9 / Windows 7 compatible, V4 improvements
+
+# Version 3
+python "src/Version 3/box2V3.py"
+python "src/Version 3/box1V3.py"
+python "src/Version 3/studiovision_monitorV3.py"
+python "src/Version 3/windows7V3.py"
 
 # Version 2
-python "src/Vesion 2/box2V2.py"
-python "src/Vesion 2/studiovision_monitorV2.py"
-python "src/Vesion 2/windows7V2.py"        # Windows 7 / Python 3.9
+python "src/Version 2/box2V2.py"
+python "src/Version 2/studiovision_monitorV2.py"
+python "src/Version 2/windows7V2.py"
 
 # Version 1
 python src/box2.py
 python src/studiovision_monitor.py
-python src/windows7.py                     # Windows 7 / Python 3.9
+python src/windows7.py
 ```
 
-Logs are written to both the console and `~/studiovision/image_router.log` (V3) or `image_router.log` in the working directory (V1/V2).  
-Stop with `Ctrl+C` — the script will finish processing any remaining queued files before exiting.
+Logs are written to both the console and `~/studiovision/image_router.log` (V3/V4) or `image_router.log` in the working directory (V1/V2).  
+Stop with `Ctrl+C`, or use the **Quit** menu item in the system tray (V4) — the script will finish processing any remaining queued files before exiting.
 
 ---
 
@@ -198,60 +227,4 @@ All orphan events are logged as warnings and must be handled manually.
 
 - `pythoncom.CoInitialize()` / `CoUninitialize()` are called on the worker thread — COM objects cannot be shared across threads.
 - `DOCUM.MDB` is read-only for inserts; all writes go to `PUBLIC.MDB`.
-- The `windows7.py` and `windows7V2.py` variants avoid `X | None` union syntax, using `typing.Optional` instead for compatibility with Python 3.9.
-- In V3, the Watchdog observer is a `PollingObserver`, which works reliably on network shares (SMB/UNC) where native filesystem events are not propagated to the client.
-
----
-
-## Deployment
-
-The scripts are packaged as standalone executables using **PyInstaller** and launched automatically at Windows startup via a shortcut in the Startup folder.
-
-### Build the executable
-
-```cmd
-cd C:\PATH\TO\src\Version 3
-pyinstaller --onefile --noconsole --name PROGRAM_NAME SCRIPT_NAME.py
-```
-
-> Replace `SCRIPT_NAME.py` with the desired variant (`box2V3.py`, `box1V3.py`, etc.) and `PROGRAM_NAME` with the chosen executable name.
-
-### Add to Windows Startup (PowerShell)
-
-```powershell
-$exe = "C:\PATH\TO\dist\PROGRAM_NAME.exe"
-$startup = [System.Environment]::GetFolderPath("Startup")
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut("$startup\PROGRAM_NAME.lnk")
-$shortcut.TargetPath = $exe
-$shortcut.WorkingDirectory = "C:\PATH\TO\dist"
-$shortcut.Save()
-```
-
-### Remove from Startup & stop the process (CMD)
-
-```cmd
-taskkill /f /im PROGRAM_NAME.exe /t
-del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PROGRAM_NAME.lnk"
-```
-
-### Schedule at logon via Task Scheduler (optional alternative to Startup shortcut)
-
-```cmd
-schtasks /create /tn "TASK_NAME" /tr "C:\PATH\TO\dist\PROGRAM_NAME.exe" /sc onlogon /delay 0001:30 /rl highest /ru SYSTEM /f
-```
-
-### Disable sleep & hibernation (CMD)
-
-```cmd
-powercfg /change standby-timeout-ac 0
-powercfg /change monitor-timeout-ac 0
-powercfg /change hibernate-timeout-ac 0
-```
-
-### Check Startup folder & scheduled task
-
-```cmd
-dir "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
-schtasks /query /tn "TASK_NAME"
-```
+- In V4, pystray requires the main thread on Windows. The observer and worker

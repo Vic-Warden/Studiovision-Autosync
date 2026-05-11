@@ -1,3 +1,9 @@
+# Core — all versions
 watchdog
 pyodbc
 pywin32
+pythoncom  # included with pywin32, listed explicitly for clarity
+
+# System tray + icon — Version 4 only (optional, falls back to headless if missing)
+pystray
+Pillow

@@ -121,17 +121,52 @@ The watched extensions and `EXAM_DESCRIPTION` mapping include document formats:
 - Microsoft Access ODBC driver installed on the machine.
 - `pystray` and `Pillow` for the system tray icon (V4 only — the script falls back to headless mode if unavailable).
 
-```bash
+| Package | Purpose | Versions |
+|---|---|---|
+| `watchdog` | File system monitoring | All |
+| `pyodbc` | Access database connection via ODBC | All |
+| `pywin32` | COM automation for interacting with Access (`win32com`, `pythoncom`) | All |
+| `pystray` | System tray icon | V4 only |
+| `Pillow` | Icon image generation | V4 only |
+
+### Installation — PowerShell (recommended)
+
+> **Run PowerShell as Administrator** the first time to allow script execution if needed.
+
+**Install all dependencies at once (V4 — full install):**
+
+```powershell
 pip install -r requirements.txt
 ```
 
-| Package | Purpose |
-|---|---|
-| `watchdog` | File system monitoring |
-| `pyodbc` | Access database connection via ODBC |
-| `pywin32` | COM automation for interacting with Access |
-| `pystray` | System tray icon (V4) |
-| `Pillow` | Icon image generation (V4) |
+**Or install packages individually:**
+
+```powershell
+# Core packages — required for all versions
+pip install watchdog
+pip install pyodbc
+pip install pywin32
+
+# Post-install step required for pywin32 (run once after install)
+python -m pywin32_postinstall -install
+
+# Optional — only needed for Version 4 system tray / notifications
+pip install pystray
+pip install Pillow
+```
+
+**Verify the installation:**
+
+```powershell
+python -c "import watchdog, pyodbc, pythoncom, win32com; print('Core OK')"
+python -c "import pystray, PIL; print('Tray OK')"
+```
+
+**Upgrade all packages to the latest version:**
+
+```powershell
+pip install --upgrade watchdog pyodbc pywin32 pystray Pillow
+```
 
 ---
 

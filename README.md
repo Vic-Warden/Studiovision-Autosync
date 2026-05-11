@@ -7,36 +7,40 @@ When a medical imaging device saves a photo, the script detects it, identifies t
 
 ## Scripts
 
-Six variants are provided in `src/`. They share the same core logic and configuration constants.
+Several variants are provided in `src/`. They share the same core logic and configuration constants.
 
-| File | Version | Description |
+| File | Location | Description |
 |---|---|---|
-| `studiovision_monitor.py` | v3.5 | Base version. Watches a flat source folder for new images. |
-| `windows7.py` | v3.5 | Same as above, using `typing.Optional` for Python 3.9 / Windows 7 compatibility. |
-| `box2.py` | v3.6 | Extended version with **Nidek device support** (see below). |
-| `studiovision_monitorV2.py` | v3.6 | Improved base version with **batched UI refresh** and **SFDoc-only requery** (see below). |
-| `windows7V2.py` | v3.6 | V2 improvements ported to Python 3.9 / Windows 7 compatible syntax (`typing.Optional`). |
-| `box2V2.py` | v3.6 | Nidek support + V2 improvements (batched refresh, SFDoc-only requery). |
+| `studiovision_monitor.py` | `src/` | Base version. Watches a flat source folder for new images. |
+| `windows7.py` | `src/` | Same as above, using `typing.Optional` for Python 3.9 / Windows 7 compatibility. |
+| `box2.py` | `src/` | Extended version with **Nidek device support**. |
+| `studiovision_monitorV2.py` | `src/Vesion 2/` | Improved base version with **batched UI refresh** and **SFDoc-only requery**. |
+| `windows7V2.py` | `src/Vesion 2/` | V2 improvements ported to Python 3.9 / Windows 7 compatible syntax. |
+| `box2V2.py` | `src/Vesion 2/` | Nidek support + V2 improvements (batched refresh, SFDoc-only requery). |
+| `studiovision_monitorV3.py` | `src/Version 3/` | **Latest.** Base version with all V3 improvements. |
+| `windows7V3.py` | `src/Version 3/` | **Latest.** Python 3.9 / Windows 7 compatible, V3 improvements. |
+| `box1V3.py` | `src/Version 3/` | **Latest.** Standard device (Box 1) with all V3 improvements. |
+| `box2V3.py` | `src/Version 3/` | **Latest.** Nidek OCT device (Box 2) + all V3 improvements. |
 
 ---
 
 ## How it works
 
-1. **Watchdog** monitors `SOURCE_DIR` for new image files (recursively).
+1. **Watchdog** monitors `SOURCE_DIR` for new image and document files (recursively).
 2. Each detected file is pushed to a queue and picked up by a background worker thread.
 3. The worker waits until the device has finished writing the file (lock-check with retries).
 4. It polls the active StudioVision Access form via COM to get the current patient (code, last name, first name).
 5. It queries `PUBLIC.MDB` to resolve the patient's folder on the network drive using an existing `Photo externe` entry.
 6. It moves the image into that folder, appending a timestamp suffix on name conflict.
 7. It inserts a new row into `PUBLIC.MDB` so StudioVision registers the image.
-8. It requeried the `SFDoc` subform (with a `Refresh()` fallback) and moves to the last record so the new image is immediately visible.
+8. It requeues the `SFDoc` subform (with a `Refresh()` fallback) and moves to the last record so the new image is immediately visible.
 9. If no patient is found within the configured timeout, the file is moved to the orphan folder.
 
 ---
 
-## Nidek device support (`box2.py` and `box2V2.py`)
+## Nidek device support (`box2.py`, `box2V2.py`, `box2V3.py`)
 
-Nidek devices save scans as a set of files inside a sub-folder (`SOURCE_DIR/<device>/<scan>/`). `box2.py` handles this layout:
+Nidek devices save scans as a set of files inside a sub-folder (`SOURCE_DIR/<device>/<scan>/`). The box2 variants handle this layout:
 
 - Waits 2 seconds after the first file event to let the full scan land.
 - Deletes XML sidecar files automatically.
@@ -48,10 +52,50 @@ Files not inside a Nidek sub-folder are processed normally (same as the base ver
 
 ---
 
+## Version 3 improvements (`src/Version 3/`)
+
+All four V3 scripts (`studiovision_monitorV3.py`, `windows7V3.py`, `box1V3.py`, `box2V3.py`) are the latest iteration and include all previous improvements plus the following:
+
+### Network share wait
+At startup, the script blocks until `SOURCE_DIR` is accessible. For UNC/network paths (`\\server\share`), it retries every 10 seconds and logs a warning on each failed attempt, so the program waits silently rather than crashing if the share is temporarily unreachable.
+
+### Auto-reconnect observer loop
+The main loop monitors the Watchdog observer. If it dies (e.g. due to a temporary network drop), the script automatically stops the old observer, waits for the share to come back, and restarts a fresh observer — no manual restart required.
+
+### Source directory cleanup at startup
+`clear_source_dir()` is called once after the network share is confirmed reachable. It deletes all files and sub-folders left over in `SOURCE_DIR` from a previous session, ensuring a clean slate.
+
+### Sleep prevention
+`prevent_sleep()` calls `SetThreadExecutionState` to prevent Windows from sleeping or turning off the display while the script is running.
+
+### Burst debounce with patient-code guard
+UI refresh is deferred until the queue has been idle for **1.5 seconds**, reducing the number of COM calls during rapid multi-file acquisitions. The patient code captured at insert time is compared against the active patient at refresh time — if the operator navigated away during the burst, the refresh is skipped to avoid updating the wrong record.
+
+### Dirty-state guard
+Before calling `Requery()` on the SFDoc subform, the script checks `form.Dirty`. If the parent form is in edit mode, it clears `Dirty` first to prevent Access from raising a save-prompt dialog.
+
+### Requery retry loop
+`Requery()` on `SFDoc` is retried up to 3 times (0.5 s between attempts) before falling back to `Refresh()`.
+
+### Centralized log file
+Logs are now written to `~/studiovision/image_router.log` (the `studiovision` folder in the user's home directory) instead of the working directory, making them easier to find on deployment machines.
+
+### Document file support
+The watched extensions and `EXAM_DESCRIPTION` mapping now include document formats:
+
+| Extension | Description inserted |
+|---|---|
+| `.tif`, `.tiff` | `OCT` |
+| `.dcm` | `DICOM` |
+| `.pdf`, `.rtf`, `.doc`, `.docx`, `.odt` | `Document` |
+| all others | `Image` |
+
+---
+
 ## Requirements
 
 - **Windows only** — requires `win32com` (COM automation) and `pyodbc` (Access ODBC driver).
-- Python 3.10+ (`studiovision_monitor.py`, `studiovision_monitorV2.py`, `box2.py`, `box2V2.py`) or Python 3.9+ (`windows7.py`, `windows7V2.py`).
+- Python 3.10+ (`studiovision_monitor.py`, `box2.py`, `box2V2.py`, `box2V3.py`) or Python 3.9+ (`windows7.py`, `windows7V2.py`).
 - Microsoft Access ODBC driver installed on the machine.
 
 ```bash
@@ -94,15 +138,9 @@ Other tunable constants:
 
 The following file extensions are monitored by default:
 
-`.jpg`, `.jpeg`, `.jfif`, `.png`, `.bmp`, `.tif`, `.tiff`, `.dcm`
+`.jpg`, `.jpeg`, `.jfif`, `.png`, `.bmp`, `.tif`, `.tiff`, `.dcm`, `.pdf`, `.rtf`, `.doc`, `.docx`, `.odt`
 
-File type → database description mapping:
-
-| Extension | Description inserted |
-|---|---|
-| `.tif`, `.tiff` | `OCT` |
-| `.dcm` | `DICOM` |
-| all others | `Image` |
+> **Note:** document extensions (`.pdf`, `.rtf`, `.doc`, `.docx`, `.odt`) are only present in `box2V3.py`. Earlier versions watch image extensions only.
 
 To add or remove extensions, edit `WATCHED_EXTENSIONS` and update `EXAM_DESCRIPTION` accordingly.
 
@@ -111,20 +149,24 @@ To add or remove extensions, edit `WATCHED_EXTENSIONS` and update `EXAM_DESCRIPT
 ## Running
 
 ```bash
-python src/box2V2.py
-# or
+# Version 3 — recommended
+python "src/Version 3/box2V3.py"           # Nidek OCT device (Box 2) + all V3 improvements
+python "src/Version 3/box1V3.py"           # Standard device (Box 1) + all V3 improvements
+python "src/Version 3/studiovision_monitorV3.py"  # Base version with V3 improvements
+python "src/Version 3/windows7V3.py"       # Python 3.9 / Windows 7 compatible, V3 improvements
+
+# Version 2
+python "src/Vesion 2/box2V2.py"
+python "src/Vesion 2/studiovision_monitorV2.py"
+python "src/Vesion 2/windows7V2.py"        # Windows 7 / Python 3.9
+
+# Version 1
 python src/box2.py
-# or
-python src/studiovision_monitorV2.py
-# or
 python src/studiovision_monitor.py
-# or
-python src/windows7V2.py   # Windows 7 / Python 3.9, with V2 improvements
-# or
-python src/windows7.py     # Windows 7 / Python 3.9, base version
+python src/windows7.py                     # Windows 7 / Python 3.9
 ```
 
-Logs are written to both the console and `image_router.log` in the working directory.  
+Logs are written to both the console and `~/studiovision/image_router.log` (V3) or `image_router.log` in the working directory (V1/V2).  
 Stop with `Ctrl+C` — the script will finish processing any remaining queued files before exiting.
 
 ---
@@ -157,7 +199,7 @@ All orphan events are logged as warnings and must be handled manually.
 - `pythoncom.CoInitialize()` / `CoUninitialize()` are called on the worker thread — COM objects cannot be shared across threads.
 - `DOCUM.MDB` is read-only for inserts; all writes go to `PUBLIC.MDB`.
 - The `windows7.py` and `windows7V2.py` variants avoid `X | None` union syntax, using `typing.Optional` instead for compatibility with Python 3.9.
-- The V2 variants (`studiovision_monitorV2.py`, `box2V2.py`, `windows7V2.py`) share the same improvements: batched UI refresh and SFDoc-only requery.
+- In V3, the Watchdog observer is a `PollingObserver`, which works reliably on network shares (SMB/UNC) where native filesystem events are not propagated to the client.
 
 ---
 
@@ -168,49 +210,48 @@ The scripts are packaged as standalone executables using **PyInstaller** and lau
 ### Build the executable
 
 ```cmd
-cd C:\path\to\script
-pyinstaller --onefile --noconsole --name studiovision_monitor studiovision_monitor.py
+cd C:\PATH\TO\src\Version 3
+pyinstaller --onefile --noconsole --name PROGRAM_NAME SCRIPT_NAME.py
 ```
 
-> Replace `studiovision_monitor` with `windows7`, `box2`, etc. as needed.
+> Replace `SCRIPT_NAME.py` with the desired variant (`box2V3.py`, `box1V3.py`, etc.) and `PROGRAM_NAME` with the chosen executable name.
 
 ### Add to Windows Startup (PowerShell)
 
 ```powershell
-$exe     = "C:\Users\Optovue User\Desktop\dist\studiovision_monitor.exe"
+$exe = "C:\PATH\TO\dist\PROGRAM_NAME.exe"
 $startup = [System.Environment]::GetFolderPath("Startup")
-$shell   = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut("$startup\studiovision_monitor.lnk")
-$shortcut.TargetPath       = $exe
-$shortcut.WorkingDirectory = "C:\Users\Optovue User\Desktop\dist"
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut("$startup\PROGRAM_NAME.lnk")
+$shortcut.TargetPath = $exe
+$shortcut.WorkingDirectory = "C:\PATH\TO\dist"
 $shortcut.Save()
 ```
 
 ### Remove from Startup & stop the process (CMD)
 
 ```cmd
-taskkill /f /im studiovision_monitor.exe /t
-del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\studiovision_monitor.lnk"
+taskkill /f /im PROGRAM_NAME.exe /t
+del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PROGRAM_NAME.lnk"
 ```
 
-### Check Startup folder contents
+### Schedule at logon via Task Scheduler (optional alternative to Startup shortcut)
+
+```cmd
+schtasks /create /tn "TASK_NAME" /tr "C:\PATH\TO\dist\PROGRAM_NAME.exe" /sc onlogon /delay 0001:30 /rl highest /ru SYSTEM /f
+```
+
+### Disable sleep & hibernation (CMD)
+
+```cmd
+powercfg /change standby-timeout-ac 0
+powercfg /change monitor-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0
+```
+
+### Check Startup folder & scheduled task
 
 ```cmd
 dir "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+schtasks /query /tn "TASK_NAME"
 ```
-
----
-
-## studiovision_monitorV2.py / box2V2.py / windows7V2.py — what changed vs v3.5
-
-### Batched UI refresh (burst debounce)
-
-In v3.5, `refresh_ui()` was called immediately after every successful DB insert, which caused Access to freeze when a device sent several images in rapid succession.
-
-`studiovision_monitorV2.py` replaces the blocking `file_queue.get()` with a `get(timeout=1.5)`. After each successful insert a `needs_refresh` flag is raised instead of calling `refresh_ui()` immediately. When the queue stays empty for 1.5 s (i.e. the burst is over), the refresh fires exactly once and the flag resets. This collapses N consecutive refreshes into a single one.
-
-### SFDoc-only requery
-
-In v3.5, `refresh_ui()` called `Requery()` / `Refresh()` on the entire active form, which reset the parent form's current-record pointer and sent the doctor back to record #1.
-
-`studiovision_monitorV2.py` introduces `_find_sfdoc()`, which recursively walks the control tree to locate the `SFDoc` subform and requeried **only that subform**. The parent form's recordset is never touched.

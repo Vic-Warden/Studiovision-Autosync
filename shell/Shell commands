@@ -1,59 +1,25 @@
-cd C:\chemin\vers\ton\script
-pyinstaller --onefile --noconsole --name studiovision_monitor studiovision_monitor.py
-$exe = "C:\Users\Optovue User\Desktop\Vic\dist\studiovision_monitor.exe"
+# cmd
+taskkill /f /im NOM_DU_PROGRAMME.exe /t
+schtasks /delete /tn "NOM_TACHE" /f
+del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\NOM_DU_PROGRAMME.lnk"
 
+cd C:\CHEMIN\VERS\TON\DOSSIER
+pyinstaller --onefile --noconsole --name NOM_DU_PROGRAMME NOM_DU_SCRIPT.py
+
+# powershell
+$exe = "C:\CHEMIN\VERS\dist\NOM_DU_PROGRAMME.exe"
 $startup = [System.Environment]::GetFolderPath("Startup")
-
 $shell = New-Object -ComObject WScript.Shell
-
-$shortcut = $shell.CreateShortcut("$startup\studiovision_monitor.lnk")
-
+$shortcut = $shell.CreateShortcut("$startup\NOM_DU_PROGRAMME.lnk")
 $shortcut.TargetPath = $exe
-
-$shortcut.WorkingDirectory = "C:\Users\Optovue User\Desktop\Vic\dist"
-
+$shortcut.WorkingDirectory = "C:\CHEMIN\VERS\dist"
 $shortcut.Save()
 
 # cmd
-
-taskkill /f /im windows7.exe /t
-
-schtasks /delete /tn "windows7" /f
-
-del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\windows7.lnk"
-del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\studiovision_monitor.lnk"
-
-rmdir /s /q "C:\Users\Optovue User\Desktop\Vic"
-
-schtasks /query /tn "windows7"
-dir "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
-
-# powershell
-
-Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\studiovision_monitor.lnk" -Force
-
-dir "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
-
-# Test
-
-# cmd
-cd C:\Users\Optovue User\Desktop\NouveauDossier
-pyinstaller --onefile --noconsole --name windows7 windows7.py
-
-# powershell
-$exe = "C:\Users\Optovue User\Desktop\NouveauDossier\dist\windows7.exe"
-$startup = [System.Environment]::GetFolderPath("Startup")
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut("$startup\windows7.lnk")
-$shortcut.TargetPath = $exe
-$shortcut.WorkingDirectory = "C:\Users\Optovue User\Desktop\NouveauDossier\dist"
-$shortcut.Save()
-
-# Create a scheduled task for box1
-
-schtasks /create /tn "box1" /tr "C:\Scripts\box1.exe" /sc onlogon /delay 0001:30 /rl highest /ru SYSTEM /f
-
-# Disable sleep, monitor off, and hibernate on AC power
+schtasks /create /tn "NOM_TACHE" /tr "C:\CHEMIN\VERS\dist\NOM_DU_PROGRAMME.exe" /sc onlogon /delay 0001:30 /rl highest /ru SYSTEM /f
 powercfg /change standby-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
+
+schtasks /query /tn "NOM_TACHE"
+dir "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"

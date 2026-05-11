@@ -60,7 +60,7 @@ PUBLIC_MDB  = Path(r"??")
 DOCUM_MDB   = Path(r"??")
 
 # Supported image extensions
-WATCHED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm"}
+WATCHED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt"}
 FILE_LOCK_RETRY_DELAY  = 3
 FILE_LOCK_MAX_ATTEMPTS = 15
 PATIENT_POLL_INTERVAL  = 3
@@ -81,9 +81,16 @@ EXAM_DESCRIPTION = {
     ".jfif": "Image",
     ".png":  "Image",
     ".bmp":  "Image",
+    
     ".tif":  "OCT",
     ".tiff": "OCT",
     ".dcm":  "DICOM",
+
+    ".pdf":  "Document",
+    ".rtf":  "Document",
+    ".doc":  "Document",
+    ".docx": "Document",
+    ".odt":  "Document"
 }
 
 # Log file is written to ~/studiovision/ so the path is valid both when running

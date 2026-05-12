@@ -23,3 +23,17 @@ powercfg /change monitor-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 
 dir "%USERPROFILE%\Desktop\NOM_DU_PROGRAMME.lnk"
+
+@echo off
+:: On cherche si l'exe tourne déjà
+tasklist /FI "IMAGENAME eq NOM_DU_PROGRAMME.exe" | find /I "NOM_DU_PROGRAMME.exe" > nul
+
+:: Si la commande trouve le processus
+if %errorlevel% equ 0 (
+    :: Affiche une vraie fenêtre popup Windows au milieu de l'écran
+    powershell -WindowStyle Hidden -Command "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; [System.Windows.Forms.MessageBox]::Show('Le routeur d''images est déjà en cours d''exécution. Regardez dans la barre des tâches (en bas à droite).', 'Déjà ouvert', 'OK', 'Information')"
+    exit
+) else (
+    :: S'il n'est pas trouvé, on le lance
+    start "" "C:\CHEMIN\VERS\TON\DOSSIER\dist\NOM_DU_PROGRAMME.exe"
+)

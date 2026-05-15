@@ -1,39 +1,99 @@
-:: cmd
-taskkill /f /im NOM_DU_PROGRAMME.exe /t
-schtasks /delete /tn "NOM_TACHE" /f
-del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\NOM_DU_PROGRAMME.lnk"
+::  studiovision_scripts.cmd
+::  All setup and maintenance commands for Studiovision-Autosync.
+::  Each section is independent — copy and run the relevant block.
+::
+::  Sections:
+::    1. Build executable         [CMD]
+::    2. Create desktop shortcut  [PowerShell]
+::    3. Power settings           [CMD - run as Administrator]
+::    4. Launcher with popup      [CMD]
+::    5. Uninstall / cleanup      [CMD]
+::
+::  Before using: update APP_NAME and paths in each section.
 
-:: cmd 
-cd C:\CHEMIN\VERS\TON\DOSSIER
-pyinstaller --onefile --noconsole --collect-all pystray --collect-all PIL --name NOM_DU_PROGRAMME NOM_DU_SCRIPT.py
 
-:: powershell 
-$exe = "C:\CHEMIN\VERS\TON\DOSSIER\dist\NOM_DU_PROGRAMME.exe"
-$desktop = [System.Environment]::GetFolderPath("Desktop")
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut("$desktop\NOM_DU_PROGRAMME.lnk")
-$shortcut.TargetPath = $exe
-$shortcut.WorkingDirectory = "C:\CHEMIN\VERS\TON\DOSSIER\dist"
-$shortcut.Description = "Lancer le routeur d'images médicales"
-$shortcut.Save()
 
-:: cmd
+::  SECTION 1 — Build executable
+::  [CMD]
+::  Compiles the Python script into a standalone .exe
+::  Requires: pip install pyinstaller
+::  Run once after any code change.
+
+set APP_NAME=AutosyncImages
+set SCRIPT=box1V4.py
+set SRC_DIR=C:\ProgramData\StudiovisionAutosync\src\Version 4
+
+cd /d "%SRC_DIR%"
+
+pyinstaller ^
+    --onefile ^
+    --noconsole ^
+    --collect-all pystray ^
+    --collect-all PIL ^
+    --name "%APP_NAME%" ^
+    "%SCRIPT%"
+
+
+::  SECTION 2 — Create desktop shortcut
+::  [PowerShell]
+::  Run once after the build. Creates a .lnk on the Desktop.
+
+:: [PowerShell]
+$AppName  = "AutosyncImages"
+$ExePath  = "C:\ProgramData\StudiovisionAutosync\src\Version 4\dist\$AppName.exe"
+$WorkDir  = "C:\ProgramData\StudiovisionAutosync\src\Version 4\dist"
+
+$Desktop      = [System.Environment]::GetFolderPath("Desktop")
+$ShortcutPath = "$Desktop\$AppName.lnk"
+
+$Shell         = New-Object -ComObject WScript.Shell
+$Shortcut      = $Shell.CreateShortcut($ShortcutPath)
+$Shortcut.TargetPath       = $ExePath
+$Shortcut.WorkingDirectory = $WorkDir
+$Shortcut.Description      = "Launch the medical image router"
+$Shortcut.Save()
+
+Write-Host "Shortcut created: $ShortcutPath"
+
+
+::  SECTION 3 — Power settings
+::  [CMD - run as Administrator]
+::  Disables sleep, monitor timeout, and hibernation on AC power.
+::  Run once per machine.
+
 powercfg /change standby-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 
-dir "%USERPROFILE%\Desktop\NOM_DU_PROGRAMME.lnk"
+
+::  SECTION 4 — Launcher with duplicate check
+::  [CMD]
+::  Shows a popup if the .exe is already running.
+::  Use this as the target of the startup shortcut instead of
+::  pointing directly to the .exe.
 
 @echo off
-:: On cherche si l'exe tourne déjà
-tasklist /FI "IMAGENAME eq NOM_DU_PROGRAMME.exe" | find /I "NOM_DU_PROGRAMME.exe" > nul
+set APP_NAME=AutosyncImages
+set EXE_PATH=C:\ProgramData\StudiovisionAutosync\src\Version 4\dist\%APP_NAME%.exe
 
-:: Si la commande trouve le processus
+tasklist /FI "IMAGENAME eq %APP_NAME%.exe" | find /I "%APP_NAME%.exe" > nul
+
 if %errorlevel% equ 0 (
-    :: Affiche une vraie fenêtre popup Windows au milieu de l'écran
-    powershell -WindowStyle Hidden -Command "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; [System.Windows.Forms.MessageBox]::Show('Le routeur d''images est déjà en cours d''exécution. Regardez dans la barre des tâches (en bas à droite).', 'Déjà ouvert', 'OK', 'Information')"
-    exit
+    powershell -WindowStyle Hidden -Command ^
+        "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; ^
+         [System.Windows.Forms.MessageBox]::Show( ^
+            'The image router is already running. Check the system tray (bottom-right).', ^
+            'Already running', 'OK', 'Information')"
 ) else (
-    :: S'il n'est pas trouvé, on le lance
-    start "" "C:\CHEMIN\VERS\TON\DOSSIER\dist\NOM_DU_PROGRAMME.exe"
+    start "" "%EXE_PATH%"
 )
+
+::  SECTION 5 — Uninstall / cleanup
+::  [CMD]
+::  Stops the running process and removes all shortcuts.
+
+set APP_NAME=AutosyncImages
+
+taskkill /f /im "%APP_NAME%.exe" /t 2>nul
+del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\%APP_NAME%.lnk" 2>nul
+del "%USERPROFILE%\Desktop\%APP_NAME%.lnk" 2>nul

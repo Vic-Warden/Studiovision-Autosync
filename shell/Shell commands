@@ -1,39 +1,99 @@
-:: cmd
-taskkill /f /im NOM_DU_PROGRAMME.exe /t
-schtasks /delete /tn "" /f
-del "%APPDATA%\.lnk"
+::  studiovision_scripts.cmd
+::  All setup and maintenance commands for Studiovision-Autosync.
+::  Each section is independent — copy and run the relevant block.
+::
+::  Sections:
+::    1. Build executable         [CMD]
+::    2. Create desktop shortcut  [PowerShell]
+::    3. Power settings           [CMD - run as Administrator]
+::    4. Launcher with popup      [CMD]
+::    5. Uninstall / cleanup      [CMD]
+::
+::  Before using: update APP_NAME and paths in each section.
 
-:: cmd 
-cd C:\CHEMIN\VERS\TON\DOSSIER
-pyinstaller --onefile --noconsole --collect-all pystray --collect-all PIL --name NOM_DU_PROGRAMME NOM_DU_SCRIPT.py
 
-:: powershell 
-$exe = ""
-$desktop = [System.Environment]::GetFolderPath("")
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut("$.lnk")
-$shortcut.TargetPath = $exe
-$shortcut.WorkingDirectory = ""
-$shortcut.Description = "Launch the medical image router"
-$shortcut.Save()
 
-:: cmd
+::  SECTION 1 — Build executable
+::  [CMD]
+::  Compiles the Python script into a standalone .exe
+::  Requires: pip install pyinstaller
+::  Run once after any code change.
+
+set APP_NAME=AutosyncImages
+set SCRIPT=box1V4.py
+set SRC_DIR=C:\ProgramData\StudiovisionAutosync\src\Version 4
+
+cd /d "%SRC_DIR%"
+
+pyinstaller ^
+    --onefile ^
+    --noconsole ^
+    --collect-all pystray ^
+    --collect-all PIL ^
+    --name "%APP_NAME%" ^
+    "%SCRIPT%"
+
+
+::  SECTION 2 — Create desktop shortcut
+::  [PowerShell]
+::  Run once after the build. Creates a .lnk on the Desktop.
+
+:: [PowerShell]
+$AppName  = "AutosyncImages"
+$ExePath  = "C:\ProgramData\StudiovisionAutosync\src\Version 4\dist\$AppName.exe"
+$WorkDir  = "C:\ProgramData\StudiovisionAutosync\src\Version 4\dist"
+
+$Desktop      = [System.Environment]::GetFolderPath("Desktop")
+$ShortcutPath = "$Desktop\$AppName.lnk"
+
+$Shell         = New-Object -ComObject WScript.Shell
+$Shortcut      = $Shell.CreateShortcut($ShortcutPath)
+$Shortcut.TargetPath       = $ExePath
+$Shortcut.WorkingDirectory = $WorkDir
+$Shortcut.Description      = "Launch the medical image router"
+$Shortcut.Save()
+
+Write-Host "Shortcut created: $ShortcutPath"
+
+
+::  SECTION 3 — Power settings
+::  [CMD - run as Administrator]
+::  Disables sleep, monitor timeout, and hibernation on AC power.
+::  Run once per machine.
+
 powercfg /change standby-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 
-dir ".lnk"
+
+::  SECTION 4 — Launcher with duplicate check
+::  [CMD]
+::  Shows a popup if the .exe is already running.
+::  Use this as the target of the startup shortcut instead of
+::  pointing directly to the .exe.
 
 @echo off
-:: Check if the exe is already running
-tasklist /FI ".exe" | find /I ".exe" > nul
+set APP_NAME=AutosyncImages
+set EXE_PATH=C:\ProgramData\StudiovisionAutosync\src\Version 4\dist\%APP_NAME%.exe
 
-:: If the process is found
+tasklist /FI "IMAGENAME eq %APP_NAME%.exe" | find /I "%APP_NAME%.exe" > nul
+
 if %errorlevel% equ 0 (
-    :: Show a Windows popup window in the center of the screen
-    powershell -WindowStyle Hidden -Command "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; [System.Windows.Forms.MessageBox]::Show('The image router is already running. Check the taskbar (bottom right).', 'Already open', 'OK', 'Information')"
-    exit
+    powershell -WindowStyle Hidden -Command ^
+        "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; ^
+         [System.Windows.Forms.MessageBox]::Show( ^
+            'The image router is already running. Check the system tray (bottom-right).', ^
+            'Already running', 'OK', 'Information')"
 ) else (
-    :: If not found, launch it
-    start "" ".exe"
+    start "" "%EXE_PATH%"
 )
+
+::  SECTION 5 — Uninstall / cleanup
+::  [CMD]
+::  Stops the running process and removes all shortcuts.
+
+set APP_NAME=AutosyncImages
+
+taskkill /f /im "%APP_NAME%.exe" /t 2>nul
+del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\%APP_NAME%.lnk" 2>nul
+del "%USERPROFILE%\Desktop\%APP_NAME%.lnk" 2>nul

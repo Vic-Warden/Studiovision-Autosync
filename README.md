@@ -1,6 +1,6 @@
 # Studiovision-Autosync
 
-Automatic image routing script for [StudioVision](https://www.studiodentaire.com/) — a dental practice management software.  
+Automatic image routing script for [StudioVision](https://www.studiodentaire.com/) — a practice management software for ophthalmologists.  
 When a medical imaging device saves a photo, the script detects it, identifies the open patient in StudioVision, moves the file to the correct patient folder on the network drive, and inserts a record in the Access database so the image appears immediately in the patient's file.
 
 ---

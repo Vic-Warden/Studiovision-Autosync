@@ -1,20 +1,20 @@
 :: cmd
 taskkill /f /im NOM_DU_PROGRAMME.exe /t
-schtasks /delete /tn "NOM_TACHE" /f
-del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\NOM_DU_PROGRAMME.lnk"
+schtasks /delete /tn "" /f
+del "%APPDATA%\.lnk"
 
 :: cmd 
 cd C:\CHEMIN\VERS\TON\DOSSIER
 pyinstaller --onefile --noconsole --collect-all pystray --collect-all PIL --name NOM_DU_PROGRAMME NOM_DU_SCRIPT.py
 
 :: powershell 
-$exe = "C:\CHEMIN\VERS\TON\DOSSIER\dist\NOM_DU_PROGRAMME.exe"
-$desktop = [System.Environment]::GetFolderPath("Desktop")
+$exe = ""
+$desktop = [System.Environment]::GetFolderPath("")
 $shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut("$desktop\NOM_DU_PROGRAMME.lnk")
+$shortcut = $shell.CreateShortcut("$.lnk")
 $shortcut.TargetPath = $exe
-$shortcut.WorkingDirectory = "C:\CHEMIN\VERS\TON\DOSSIER\dist"
-$shortcut.Description = "Lancer le routeur d'images médicales"
+$shortcut.WorkingDirectory = ""
+$shortcut.Description = "Launch the medical image router"
 $shortcut.Save()
 
 :: cmd
@@ -22,18 +22,18 @@ powercfg /change standby-timeout-ac 0
 powercfg /change monitor-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 
-dir "%USERPROFILE%\Desktop\NOM_DU_PROGRAMME.lnk"
+dir ".lnk"
 
 @echo off
-:: On cherche si l'exe tourne déjà
-tasklist /FI "IMAGENAME eq NOM_DU_PROGRAMME.exe" | find /I "NOM_DU_PROGRAMME.exe" > nul
+:: Check if the exe is already running
+tasklist /FI ".exe" | find /I ".exe" > nul
 
-:: Si la commande trouve le processus
+:: If the process is found
 if %errorlevel% equ 0 (
-    :: Affiche une vraie fenêtre popup Windows au milieu de l'écran
-    powershell -WindowStyle Hidden -Command "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; [System.Windows.Forms.MessageBox]::Show('Le routeur d''images est déjà en cours d''exécution. Regardez dans la barre des tâches (en bas à droite).', 'Déjà ouvert', 'OK', 'Information')"
+    :: Show a Windows popup window in the center of the screen
+    powershell -WindowStyle Hidden -Command "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; [System.Windows.Forms.MessageBox]::Show('The image router is already running. Check the taskbar (bottom right).', 'Already open', 'OK', 'Information')"
     exit
 ) else (
-    :: S'il n'est pas trouvé, on le lance
-    start "" "C:\CHEMIN\VERS\TON\DOSSIER\dist\NOM_DU_PROGRAMME.exe"
+    :: If not found, launch it
+    start "" ".exe"
 )

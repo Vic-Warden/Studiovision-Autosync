@@ -349,35 +349,174 @@ def _find_sfdoc(form):
     return None
 
 
+def _instance_from_access_path(db_path: str) -> Instance | None:
+    """
+    Given the CurrentDb path reported by an Access COM object,
+    return the matching Instance by comparing the MDB paths.
+    Comparison is case-insensitive and normalises slashes.
+    """
+    norm = db_path.lower().replace("/", "\\")
+    for inst in INSTANCES:
+        if str(inst.public_mdb).lower().replace("/", "\\") in norm:
+            return inst
+        if str(inst.docum_mdb).lower().replace("/", "\\") in norm:
+            return inst
+    return None
+
+
+def _read_patient_from_access(access_app) -> dict | None:
+    """Extract patient fields from the active form of a given Access COM object."""
+    try:
+        form = access_app.Screen.ActiveForm
+    except Exception:
+        return None
+    if form is None:
+        return None
+
+    target = {ACCESS_FIELD_CODE, ACCESS_FIELD_NOM, ACCESS_FIELD_PRENOM}
+    data: dict = {}
+
+    for i in range(form.Controls.Count):
+        ctrl = form.Controls(i)
+        try:
+            if str(ctrl.Name) in target:
+                data[ctrl.Name] = ctrl.Value
+        except Exception:
+            pass
+
+    if not target.issubset(data.keys()):
+        return None
+
+    return {
+        "code":   str(data[ACCESS_FIELD_CODE]),
+        "nom":    str(data[ACCESS_FIELD_NOM]),
+        "prenom": str(data[ACCESS_FIELD_PRENOM]),
+    }
+
+
 def get_active_patient() -> dict | None:
-    """Read the patient currently open in the active Access form, regardless of which SV instance."""
+    """
+    Read the patient currently open in the foreground Access window.
+
+    Strategy
+    --------
+    1. Enumerate every running Access COM object via the ROT
+       (Running Object Table) so we handle two simultaneous instances.
+    2. For each Access object, determine which StudioVision instance it
+       belongs to by matching its CurrentDb path against the known MDB paths.
+    3. Return the patient from the Access window that is currently in the
+       foreground, together with a ``'instance'`` key so the worker does NOT
+       need to call ``find_instance_for_patient`` (which would risk picking
+       the wrong DB when a patient code exists in both bases).
+
+    Fallback
+    --------
+    If ROT enumeration is unavailable or returns nothing, fall back to
+    ``GetActiveObject`` (original behaviour) without the instance lock.
+    """
     if not WIN32_AVAILABLE:
         return None
+
+    # Attempt 1: enumerate the ROT to handle two simultaneous Access instances.
     try:
-        access = win32com.client.GetActiveObject("Access.Application")
-        form   = access.Screen.ActiveForm
-        if form is None:
+        import pythoncom
+        import win32com.client
+
+        ctx  = pythoncom.CreateBindCtx(0)
+        rot  = pythoncom.GetRunningObjectTable()
+        enum = rot.EnumRunning()
+
+        # hwnd of the foreground window — used to match the right Access instance
+        try:
+            import win32gui
+            fg_hwnd = win32gui.GetForegroundWindow()
+        except Exception:
+            fg_hwnd = None
+
+        best_patient  = None
+        best_instance = None
+
+        while True:
+            monikers = enum.Next(10)
+            if not monikers:
+                break
+            for moniker in monikers:
+                try:
+                    display_name = moniker.GetDisplayName(ctx, None)
+                except Exception:
+                    continue
+
+                # ROT entries for Access databases look like:
+                #   Access.Application.16  or  ...STUDIOV2000-OM\FICHIER\PUBLIC.MDB
+                if "msaccess" not in display_name.lower() and ".mdb" not in display_name.lower():
+                    continue
+
+                try:
+                    obj    = moniker.BindToObject(ctx, None, pythoncom.IID_IDispatch)
+                    access = win32com.client.Dispatch(obj)
+                except Exception:
+                    continue
+
+                # Identify which StudioVision instance this Access process belongs to
+                try:
+                    db_path  = access.CurrentDb().Name
+                    inst     = _instance_from_access_path(db_path)
+                except Exception:
+                    inst = None
+
+                patient = _read_patient_from_access(access)
+                if patient is None:
+                    continue
+
+                patient["instance"] = inst  # may be None if not recognised
+
+                # Prefer the instance whose Access window is in the foreground
+                if fg_hwnd is not None:
+                    try:
+                        import win32process, win32gui
+                        _, pid = win32process.GetWindowThreadProcessId(fg_hwnd)
+                        for p in psutil.process_iter(["pid", "name"]):
+                            if p.info["pid"] == pid and "msaccess" in (p.info["name"] or "").lower():
+                                best_patient  = patient
+                                best_instance = inst
+                                break
+                    except Exception:
+                        pass
+
+                if best_patient is None:
+                    best_patient  = patient
+                    best_instance = inst
+
+        if best_patient is not None:
+            log.debug(
+                f"ROT: active patient {best_patient['code']} "
+                f"instance={best_instance.name if best_instance else 'unknown'}"
+            )
+            return best_patient
+
+    except Exception as e:
+        log.debug(f"ROT enumeration failed, falling back to GetActiveObject: {e}")
+
+    # Fallback: original single-instance COM lookup when ROT enumeration fails or returns nothing.
+    try:
+        access  = win32com.client.GetActiveObject("Access.Application")
+        patient = _read_patient_from_access(access)
+        if patient is None:
             return None
 
-        target = {ACCESS_FIELD_CODE, ACCESS_FIELD_NOM, ACCESS_FIELD_PRENOM}
-        data: dict = {}
+        # Try to identify the instance even in fallback mode
+        try:
+            db_path  = access.CurrentDb().Name
+            inst     = _instance_from_access_path(db_path)
+        except Exception:
+            inst = None
 
-        for i in range(form.Controls.Count):
-            ctrl = form.Controls(i)
-            try:
-                if str(ctrl.Name) in target:
-                    data[ctrl.Name] = ctrl.Value
-            except Exception:
-                pass
-
-        if not target.issubset(data.keys()):
-            return None
-
-        return {
-            "code":   str(data[ACCESS_FIELD_CODE]),
-            "nom":    str(data[ACCESS_FIELD_NOM]),
-            "prenom": str(data[ACCESS_FIELD_PRENOM]),
-        }
+        patient["instance"] = inst
+        log.debug(
+            f"Fallback COM: active patient {patient['code']} "
+            f"instance={inst.name if inst else 'unknown'}"
+        )
+        return patient
 
     except Exception as e:
         log.debug(f"COM error: {e}")
@@ -591,7 +730,24 @@ def worker(file_queue: queue.Queue) -> None:
                 f"(code {patient['code']})"
             )
 
-            instance = find_instance_for_patient(patient["code"])
+            # Prefer the instance already identified by get_active_patient()
+            # (locked to the Access window that was in the foreground).
+            # Only fall back to DB search when the instance could not be
+            # determined from the COM object — this prevents cross-instance
+            # contamination when the same patient code exists in both bases.
+            instance = patient.get("instance")
+            if instance is not None:
+                log.info(
+                    f"Instance locked from active window: [{instance.name}] "
+                    f"(patient {patient['code']})"
+                )
+            else:
+                log.warning(
+                    f"Could not lock instance from active window for patient "
+                    f"{patient['code']} — falling back to DB search."
+                )
+                instance = find_instance_for_patient(patient["code"])
+
             if instance is None:
                 log.error(
                     f"Patient {patient['code']} not found in any instance. "

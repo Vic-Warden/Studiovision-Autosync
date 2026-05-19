@@ -352,14 +352,12 @@ def _find_sfdoc(form):
 def _instance_from_access_path(db_path: str) -> Instance | None:
     """
     Given the CurrentDb path reported by an Access COM object,
-    return the matching Instance by comparing the MDB paths.
-    Comparison is case-insensitive and normalises slashes.
+    return the matching Instance by comparing the folder names.
     """
     norm = db_path.lower().replace("/", "\\")
     for inst in INSTANCES:
-        if str(inst.public_mdb).lower().replace("/", "\\") in norm:
-            return inst
-        if str(inst.docum_mdb).lower().replace("/", "\\") in norm:
+        folder = inst.dest_photos.parent.name.lower()
+        if folder in norm:
             return inst
     return None
 

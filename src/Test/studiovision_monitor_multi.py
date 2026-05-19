@@ -352,26 +352,23 @@ def _find_sfdoc(form):
 def _instance_from_access_path(db_path: str) -> Instance | None:
     """
     Given the CurrentDb path reported by an Access COM object,
-    return the matching Instance by comparing the folder names.
+    return the matching Instance by comparing exact folder names.
     """
     norm = db_path.lower().replace("/", "\\")
     for inst in INSTANCES:
         folder = inst.dest_photos.parent.name.lower()
-        if folder in norm:
+        folder_pattern = f"\\{folder}\\"
+        if folder_pattern in norm:
             return inst
     return None
 
 
 def _instance_from_window_title(title: str) -> Instance | None:
-    """
-    Try to identify the Instance from an Access window title.
-    StudioVision window titles typically contain the MDB folder name,
-    e.g. "Studiov2000-OM" or "Studiov2000".
-    """
     title_lower = title.lower()
-    for inst in INSTANCES:
-        # Match on the folder name of the dest_photos / public_mdb paths
-        folder = inst.dest_photos.parent.name.lower()   # e.g. "studiov2000-om"
+    sorted_instances = sorted(INSTANCES, key=lambda i: len(i.dest_photos.parent.name), reverse=True)
+    
+    for inst in sorted_instances:
+        folder = inst.dest_photos.parent.name.lower()
         if folder in title_lower:
             return inst
     return None

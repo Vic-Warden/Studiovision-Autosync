@@ -364,6 +364,61 @@ def _instance_from_access_path(db_path: str) -> Instance | None:
     return None
 
 
+def _instance_from_window_title(title: str) -> Instance | None:
+    """
+    Try to identify the Instance from an Access window title.
+    StudioVision window titles typically contain the MDB folder name,
+    e.g. "Studiov2000-OM" or "Studiov2000".
+    """
+    title_lower = title.lower()
+    for inst in INSTANCES:
+        # Match on the folder name of the dest_photos / public_mdb paths
+        folder = inst.dest_photos.parent.name.lower()   # e.g. "studiov2000-om"
+        if folder in title_lower:
+            return inst
+    return None
+
+
+def _get_access_pids() -> dict[int, str]:
+    """
+    Return {pid: window_title} for every visible Access top-level window.
+    Uses EnumWindows so we can resolve which Access process owns which window.
+    """
+    import win32gui
+    import win32process
+
+    result: dict[int, str] = {}
+
+    def _cb(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = win32gui.GetWindowText(hwnd)
+        if not title:
+            return
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            return
+        # Only keep Access windows (check via psutil later)
+        result[hwnd] = (pid, title)
+
+    win32gui.EnumWindows(_cb, None)
+
+    # Filter to msaccess.exe PIDs
+    access_pids: dict[int, str] = {}
+    try:
+        pid_to_name = {p.info["pid"]: (p.info["name"] or "").lower()
+                       for p in psutil.process_iter(["pid", "name"])}
+    except Exception:
+        return {}
+
+    for hwnd, (pid, title) in result.items():
+        if "msaccess" in pid_to_name.get(pid, ""):
+            access_pids[pid] = title  # last window per PID wins — usually the main one
+
+    return access_pids  # {pid: window_title}
+
+
 def _read_patient_from_access(access_app) -> dict | None:
     """Extract patient fields from the active form of a given Access COM object."""
     try:
@@ -394,133 +449,217 @@ def _read_patient_from_access(access_app) -> dict | None:
     }
 
 
+def _get_access_com_objects() -> list[tuple[object, int]]:
+    """
+    Return a list of (Access COM object, pid) for every running msaccess.exe.
+
+    Technique: iterate psutil for msaccess PIDs, then use
+    win32com.client.GetObject with the process handle trick via
+    AccessibleObjectFromWindow on the main Access hwnd.
+    Fallback: GetActiveObject for a single instance.
+    """
+    import win32gui
+    import win32process
+    import win32com.client
+
+    results: list[tuple[object, int]] = []
+
+    # Map Access window titles by PID so we can later resolve instance from window title.
+    access_pid_titles: dict[int, str] = {}
+    try:
+        def _cb(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd)
+            if not title:
+                return
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                access_pid_titles[pid] = title
+            except Exception:
+                pass
+        win32gui.EnumWindows(_cb, None)
+    except Exception as e:
+        log.debug(f"EnumWindows failed: {e}")
+
+    # Get all msaccess PIDs
+    access_pids = [
+        p.info["pid"]
+        for p in psutil.process_iter(["pid", "name"])
+        if "msaccess" in (p.info["name"] or "").lower()
+    ]
+
+    if not access_pids:
+        return results
+
+    if len(access_pids) == 1:
+        # Single Access process — avoid the more complex multi-instance path.
+        try:
+            access = win32com.client.GetActiveObject("Access.Application")
+            results.append((access, access_pids[0]))
+        except Exception as e:
+            log.debug(f"GetActiveObject failed: {e}")
+        return results
+
+    # Multiple instances: bind each Access window via its HWND using the
+    # "OMain" window class, which is the top-level frame for every Access instance.
+    OBJID_NATIVEOM = -16  # OBJID_NATIVEOM constant
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        acc_hwnds: list[tuple[int, int]] = []  # (hwnd, pid)
+
+        def _find_access_main(hwnd, _):
+            cls = win32gui.GetClassName(hwnd)
+            if cls == "OMain":
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    acc_hwnds.append((hwnd, pid))
+                except Exception:
+                    pass
+
+        win32gui.EnumWindows(_find_access_main, None)
+
+        IID_IDispatch = "{00020400-0000-0000-C000-000000000046}"
+        ole32 = ctypes.oledll.oleacc
+
+        for hwnd, pid in acc_hwnds:
+            try:
+                ptr = ctypes.c_void_p()
+                riid = pythoncom.MakeIID(IID_IDispatch)
+                # AccessibleObjectFromWindow(hwnd, OBJID_NATIVEOM, IID_IDispatch, &ptr)
+                hr = ctypes.windll.oleacc.AccessibleObjectFromWindow(
+                    hwnd,
+                    ctypes.c_uint32(0xFFFFFFF0),  # OBJID_NATIVEOM
+                    ctypes.byref(pythoncom.MakeIID(IID_IDispatch)
+                                 if False else ctypes.create_string_buffer(16)),
+                    ctypes.byref(ptr),
+                )
+                # Low-level OBJID_NATIVEOM binding is fragile across Office versions;
+                # fall through to the simpler GetObject moniker approach below.
+            except Exception:
+                pass
+
+        # Office supports a "!hwnd" moniker syntax that returns the document
+        # COM object for a specific window handle, avoiding GetActiveObject
+        # which always returns the same (last registered) instance.        for hwnd, pid in acc_hwnds:
+            try:
+                access = win32com.client.GetObject(f"!{hwnd}")
+                # GetObject with an hwnd moniker returns the document; navigate up to Application.
+                try:
+                    app = access.Application
+                except Exception:
+                    app = access
+                results.append((app, pid))
+                log.debug(f"Bound Access COM via hwnd {hwnd} (pid={pid})")
+            except Exception as e:
+                log.debug(f"GetObject(!{hwnd}) failed: {e}")
+
+        if results:
+            return results
+
+    except Exception as e:
+        log.debug(f"Multi-instance COM binding failed: {e}")
+
+    # Last resort: GetActiveObject always returns the same registered instance,
+    # so this only works correctly when a single Access process is running.
+    try:
+        access = win32com.client.GetActiveObject("Access.Application")
+        pid    = access_pids[0] if access_pids else 0
+        results.append((access, pid))
+    except Exception as e:
+        log.debug(f"GetActiveObject fallback failed: {e}")
+
+    return results
+
+
 def get_active_patient() -> dict | None:
     """
     Read the patient currently open in the foreground Access window.
 
     Strategy
     --------
-    1. Enumerate every running Access COM object via the ROT
-       (Running Object Table) so we handle two simultaneous instances.
-    2. For each Access object, determine which StudioVision instance it
-       belongs to by matching its CurrentDb path against the known MDB paths.
-    3. Return the patient from the Access window that is currently in the
-       foreground, together with a ``'instance'`` key so the worker does NOT
-       need to call ``find_instance_for_patient`` (which would risk picking
-       the wrong DB when a patient code exists in both bases).
+    1. Find the PID of the foreground window (if it is an Access process).
+    2. Enumerate all Access COM objects; for each one read CurrentDb to
+       identify which StudioVision instance it belongs to.
+    3. If the foreground window belongs to one of the Access processes,
+       return the patient from that specific process.
+    4. Otherwise return the first patient found (single-instance fallback).
 
-    Fallback
-    --------
-    If ROT enumeration is unavailable or returns nothing, fall back to
-    ``GetActiveObject`` (original behaviour) without the instance lock.
+    The returned dict contains an ``'instance'`` key with the matching
+    Instance object so the worker does NOT call find_instance_for_patient,
+    preventing cross-instance contamination when a patient code exists in
+    both OM and HR databases.
     """
     if not WIN32_AVAILABLE:
         return None
 
-    # Attempt 1: enumerate the ROT to handle two simultaneous Access instances.
+    import win32gui
+    import win32process
+
+    # --- Step 1: find the foreground Access PID ------------------------------
+    fg_access_pid: int | None = None
     try:
-        import pythoncom
-        import win32com.client
-
-        ctx  = pythoncom.CreateBindCtx(0)
-        rot  = pythoncom.GetRunningObjectTable()
-        enum = rot.EnumRunning()
-
-        # hwnd of the foreground window — used to match the right Access instance
-        try:
-            import win32gui
-            fg_hwnd = win32gui.GetForegroundWindow()
-        except Exception:
-            fg_hwnd = None
-
-        best_patient  = None
-        best_instance = None
-
-        while True:
-            monikers = enum.Next(10)
-            if not monikers:
-                break
-            for moniker in monikers:
-                try:
-                    display_name = moniker.GetDisplayName(ctx, None)
-                except Exception:
-                    continue
-
-                # ROT entries for Access databases look like:
-                #   Access.Application.16  or  ...STUDIOV2000-OM\FICHIER\PUBLIC.MDB
-                if "msaccess" not in display_name.lower() and ".mdb" not in display_name.lower():
-                    continue
-
-                try:
-                    obj    = moniker.BindToObject(ctx, None, pythoncom.IID_IDispatch)
-                    access = win32com.client.Dispatch(obj)
-                except Exception:
-                    continue
-
-                # Identify which StudioVision instance this Access process belongs to
-                try:
-                    db_path  = access.CurrentDb().Name
-                    inst     = _instance_from_access_path(db_path)
-                except Exception:
-                    inst = None
-
-                patient = _read_patient_from_access(access)
-                if patient is None:
-                    continue
-
-                patient["instance"] = inst  # may be None if not recognised
-
-                # Prefer the instance whose Access window is in the foreground
-                if fg_hwnd is not None:
-                    try:
-                        import win32process, win32gui
-                        _, pid = win32process.GetWindowThreadProcessId(fg_hwnd)
-                        for p in psutil.process_iter(["pid", "name"]):
-                            if p.info["pid"] == pid and "msaccess" in (p.info["name"] or "").lower():
-                                best_patient  = patient
-                                best_instance = inst
-                                break
-                    except Exception:
-                        pass
-
-                if best_patient is None:
-                    best_patient  = patient
-                    best_instance = inst
-
-        if best_patient is not None:
-            log.debug(
-                f"ROT: active patient {best_patient['code']} "
-                f"instance={best_instance.name if best_instance else 'unknown'}"
-            )
-            return best_patient
-
+        fg_hwnd = win32gui.GetForegroundWindow()
+        if fg_hwnd:
+            _, fg_pid = win32process.GetWindowThreadProcessId(fg_hwnd)
+            for p in psutil.process_iter(["pid", "name"]):
+                if p.info["pid"] == fg_pid and "msaccess" in (p.info["name"] or "").lower():
+                    fg_access_pid = fg_pid
+                    break
     except Exception as e:
-        log.debug(f"ROT enumeration failed, falling back to GetActiveObject: {e}")
+        log.debug(f"Foreground PID detection failed: {e}")
 
-    # Fallback: original single-instance COM lookup when ROT enumeration fails or returns nothing.
-    try:
-        access  = win32com.client.GetActiveObject("Access.Application")
+    log.debug(f"Foreground Access PID: {fg_access_pid}")
+
+    com_objects = _get_access_com_objects()
+    if not com_objects:
+        log.debug("No Access COM objects found.")
+        return None
+
+    best_patient:  dict | None     = None
+    best_instance: Instance | None = None
+    best_is_fg:    bool            = False
+
+    for access, pid in com_objects:
+        # Identify instance from CurrentDb path
+        inst: Instance | None = None
+        try:
+            db_path = access.CurrentDb().Name
+            inst    = _instance_from_access_path(db_path)
+            log.debug(f"Access pid={pid} db={db_path} → instance={inst.name if inst else 'unknown'}")
+        except Exception as e:
+            log.debug(f"CurrentDb() failed for pid={pid}: {e}")
+
         patient = _read_patient_from_access(access)
         if patient is None:
-            return None
-
-        # Try to identify the instance even in fallback mode
-        try:
-            db_path  = access.CurrentDb().Name
-            inst     = _instance_from_access_path(db_path)
-        except Exception:
-            inst = None
+            log.debug(f"No active patient in Access pid={pid}")
+            continue
 
         patient["instance"] = inst
-        log.debug(
-            f"Fallback COM: active patient {patient['code']} "
-            f"instance={inst.name if inst else 'unknown'}"
-        )
-        return patient
+        is_fg = (fg_access_pid is not None and pid == fg_access_pid)
 
-    except Exception as e:
-        log.debug(f"COM error: {e}")
-        return None
+        log.debug(
+            f"Patient found: code={patient['code']} pid={pid} "
+            f"instance={inst.name if inst else 'unknown'} fg={is_fg}"
+        )
+
+        if is_fg or best_patient is None:
+            best_patient  = patient
+            best_instance = inst
+            best_is_fg    = is_fg
+            if is_fg:
+                break  # foreground match — no need to look further
+
+    if best_patient is not None:
+        log.info(
+            f"Active patient: {best_patient['nom']} {best_patient['prenom']} "
+            f"(code {best_patient['code']}) "
+            f"instance={best_instance.name if best_instance else 'unknown'} "
+            f"fg={best_is_fg}"
+        )
+    return best_patient
 
 
 def refresh_ui(expected_patient_code: str | None = None) -> None:

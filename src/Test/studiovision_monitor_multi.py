@@ -96,18 +96,18 @@ class Instance:
 
 INSTANCES: list[Instance] = [
     Instance(
-        name        = "Megret",
-        exe         = "msaccess.exe",
-        dest_photos = Path(r"\\studiovision\Studiov2000-OM\PHOTOS"),
-        public_mdb  = Path(r"\\studiovision\Studiov2000-OM\fichier\PUBLIC.MDB"),
-        docum_mdb   = Path(r"\\studiovision\Studiov2000-OM\fichier\DOCUM.MDB"),
-    ),
-    Instance(
         name        = "Romoli",
         exe         = "msaccess.exe",
         dest_photos = Path(r"\\studiovision\Studiov2000\PHOTOS"),
         public_mdb  = Path(r"\\studiovision\Studiov2000\fichier\PUBLIC.MDB"),
         docum_mdb   = Path(r"\\studiovision\Studiov2000\fichier\DOCUM.MDB"),
+    ),
+    Instance(
+        name        = "Megret",
+        exe         = "msaccess.exe",
+        dest_photos = Path(r"\\studiovision\Studiov2000-OM\PHOTOS"),
+        public_mdb  = Path(r"\\studiovision\Studiov2000-OM\fichier\PUBLIC.MDB"),
+        docum_mdb   = Path(r"\\studiovision\Studiov2000-OM\fichier\DOCUM.MDB"),
     ),
 ]
 

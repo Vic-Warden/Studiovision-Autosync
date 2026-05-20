@@ -85,6 +85,14 @@ EXAM_DESCRIPTION = {
     ".odt":  "Document",
 }
 
+DOCTOR_NAME_TO_INSTANCE: dict[str, str] = {
+    "OM":  "Megret",
+    "OMB": "Megret",
+    "HR":  "Romoli",
+    "HRB": "Romoli",
+}
+
+
 @dataclass
 class Instance:
     name:        str
@@ -229,37 +237,133 @@ def patient_exists_in_db(patient_code: str, instance: Instance) -> bool:
         return False
 
 
-def find_instance_for_patient(patient_code: str) -> Instance | None:
-    """
-    Determine which instance holds the given patient.
+def find_instance_from_last_consult(patient_code: str) -> "Instance | None":
+    if not PYODBC_AVAILABLE:
+        return None
 
-    Strategy:
-      1. Identify which StudioVision exe(s) are currently running.
-      2. Among those active instances, search for the patient in the DB.
-      3. If multiple match (rare), return the first one found.
-      4. Fall back to searching all instances if no exe is detected.
+    @dataclass
+    class ConsultResult:
+        inst:     Instance
+        date:     datetime
+        dr_name:  str | None
+        resolved: "Instance | None"  # instance déduite du Dr, ou None si neutre
+
+    results: list[ConsultResult] = []
+
+    for inst in INSTANCES:
+        if not inst.public_mdb.exists():
+            log.debug(f"[{inst.name}] PUBLIC.MDB inaccessible.")
+            continue
+        try:
+            conn   = db_connect(inst.public_mdb)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT TOP 1
+                    c.[Date],
+                    m.[Name]
+                FROM [Consultations] AS c
+                LEFT JOIN [Médecins] AS m
+                    ON m.[ID] = c.[Code Médecin]
+                WHERE c.[Code patient] = ?
+                  AND c.[Code Médecin] IS NOT NULL
+                ORDER BY c.[Date] DESC
+                """,
+                (int(patient_code),),
+            )
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row or not row[0]:
+                log.debug(f"[{inst.name}] Aucune consultation pour patient {patient_code}.")
+                continue
+
+            record_date = (
+                row[0] if isinstance(row[0], datetime)
+                else datetime.fromisoformat(str(row[0]))
+            )
+            dr_name  = str(row[1]).strip().upper() if row[1] else None
+            target   = DOCTOR_NAME_TO_INSTANCE.get(dr_name) if dr_name else None
+            resolved = next((i for i in INSTANCES if i.name == target), None) if target else None
+
+            log.debug(
+                f"[{inst.name}] Dernière consult : "
+                f"Date={record_date:%Y-%m-%d}  Dr={dr_name}  → résolu={target}"
+            )
+            results.append(ConsultResult(inst, record_date, dr_name, resolved))
+
+        except Exception as e:
+            log.debug(f"[{inst.name}] Erreur lecture Consultations : {e}")
+
+    if not results:
+        log.warning(f"Aucune consultation trouvée pour patient {patient_code}.")
+        return None
+
+    # Trier par date décroissante — le record le plus récent est la source de vérité.
+    results.sort(key=lambda r: r.date, reverse=True)
+    best = results[0]
+
+    if best.resolved is not None:
+        log.info(
+            f"Instance résolue via Dr '{best.dr_name}' "
+            f"(date={best.date:%Y-%m-%d}, base=[{best.inst.name}]) "
+            f"→ [{best.resolved.name}]"
+        )
+        return best.resolved
+
+    # Dr neutre (PHF, LM, CS…) : on retourne l'instance dont la base
+    # contient le record le plus récent — meilleure heuristique disponible.
+    log.warning(
+        f"Dr neutre '{best.dr_name}' pour patient {patient_code} "
+        f"— fallback sur la base la plus récente : [{best.inst.name}] "
+        f"(date={best.date:%Y-%m-%d})"
+    )
+    return best.inst
+
+
+def find_instance_for_patient(patient_code: str) -> "Instance | None":
     """
+    Détermine l'instance active pour un patient donné.
+
+    Stratégie (ordre de priorité) :
+      1. Lecture du Dr du dernier acte via jointure Médecins → le champ Name
+         (OM/OMB → Megret, HR/HRB → Romoli) est la source de vérité.
+         La base avec la consultation la plus récente l'emporte quand les
+         deux bases contiennent le même patient (OM copie souvent HR).
+      2. Fallback : recherche dans les bases des instances actives
+         (comportement d'origine, conservé si la table Consultations est
+         inaccessible ou ne contient aucune ligne pour ce patient).
+    """
+    # --- Stratégie 1 : Dr du dernier acte -----------------------------------
+    inst = find_instance_from_last_consult(patient_code)
+    if inst is not None:
+        return inst
+
+    log.warning(
+        f"Stratégie Dr échouée pour le patient {patient_code} — "
+        "repli sur la détection par processus/base."
+    )
+
+    # --- Stratégie 2 (fallback) : instances avec processus actif -----------
     running_exes = {
         (p.info["name"] or "").lower()
         for p in psutil.process_iter(["name"])
     }
-
     active_instances = [i for i in INSTANCES if i.exe.lower() in running_exes]
-
     if not active_instances:
-        log.warning("No StudioVision process detected — searching all databases as fallback.")
+        log.warning("Aucun processus StudioVision détecté — recherche dans toutes les bases.")
         active_instances = INSTANCES
 
     for inst in active_instances:
         if patient_exists_in_db(patient_code, inst):
-            log.info(f"Patient {patient_code} found in instance [{inst.name}]")
+            log.info(f"Patient {patient_code} trouvé dans l'instance [{inst.name}] (fallback).")
             return inst
 
-    log.warning(f"Patient {patient_code} not found in any active instance.")
+    log.warning(f"Patient {patient_code} introuvable dans toutes les instances.")
     return None
 
 
-def find_patient_folder(patient_code: str, instance: Instance) -> Path | None:
+def find_patient_folder(patient_code: str, instance: Instance) -> "Path | None":
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
@@ -349,7 +453,7 @@ def _find_sfdoc(form):
     return None
 
 
-def _instance_from_access_path(db_path: str) -> Instance | None:
+def _instance_from_access_path(db_path: str) -> "Instance | None":
     """
     Given the CurrentDb path reported by an Access COM object,
     return the matching Instance by comparing exact folder names.
@@ -363,10 +467,10 @@ def _instance_from_access_path(db_path: str) -> Instance | None:
     return None
 
 
-def _instance_from_window_title(title: str) -> Instance | None:
+def _instance_from_window_title(title: str) -> "Instance | None":
     title_lower = title.lower()
     sorted_instances = sorted(INSTANCES, key=lambda i: len(i.dest_photos.parent.name), reverse=True)
-    
+
     for inst in sorted_instances:
         folder = inst.dest_photos.parent.name.lower()
         if folder in title_lower:
@@ -414,7 +518,7 @@ def _get_access_pids() -> dict[int, str]:
     return access_pids  # {pid: window_title}
 
 
-def _read_patient_from_access(access_app) -> dict | None:
+def _read_patient_from_access(access_app) -> "dict | None":
     """Extract patient fields from the active form of a given Access COM object."""
     try:
         form = access_app.Screen.ActiveForm
@@ -538,7 +642,8 @@ def _get_access_com_objects() -> list[tuple[object, int]]:
 
         # Office supports a "!hwnd" moniker syntax that returns the document
         # COM object for a specific window handle, avoiding GetActiveObject
-        # which always returns the same (last registered) instance.        for hwnd, pid in acc_hwnds:
+        # which always returns the same (last registered) instance.
+        for hwnd, pid in acc_hwnds:
             try:
                 access = win32com.client.GetObject(f"!{hwnd}")
                 # GetObject with an hwnd moniker returns the document; navigate up to Application.
@@ -569,31 +674,13 @@ def _get_access_com_objects() -> list[tuple[object, int]]:
     return results
 
 
-def get_active_patient() -> dict | None:
-    """
-    Read the patient currently open in the foreground Access window.
-
-    Strategy
-    --------
-    1. Find the PID of the foreground window (if it is an Access process).
-    2. Enumerate all Access COM objects; for each one read CurrentDb to
-       identify which StudioVision instance it belongs to.
-    3. If the foreground window belongs to one of the Access processes,
-       return the patient from that specific process.
-    4. Otherwise return the first patient found (single-instance fallback).
-
-    The returned dict contains an ``'instance'`` key with the matching
-    Instance object so the worker does NOT call find_instance_for_patient,
-    preventing cross-instance contamination when a patient code exists in
-    both OM and HR databases.
-    """
+def get_active_patient() -> "dict | None":
     if not WIN32_AVAILABLE:
         return None
 
     import win32gui
     import win32process
 
-    # --- Step 1: find the foreground Access PID ------------------------------
     fg_access_pid: int | None = None
     try:
         fg_hwnd = win32gui.GetForegroundWindow()
@@ -657,7 +744,7 @@ def get_active_patient() -> dict | None:
     return best_patient
 
 
-def refresh_ui(expected_patient_code: str | None = None) -> None:
+def refresh_ui(expected_patient_code: "str | None" = None) -> None:
     """Refresh the active Access form: SFDoc Requery + MoveLast."""
     if not WIN32_AVAILABLE:
         return
@@ -752,7 +839,7 @@ def wait_for_file(file: Path) -> bool:
     return False
 
 
-def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
+def move_file(source: Path, dest_folder: Path, label: str = "") -> "Path | None":
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
     if dest.exists():
@@ -864,11 +951,6 @@ def worker(file_queue: queue.Queue) -> None:
                 f"(code {patient['code']})"
             )
 
-            # Prefer the instance already identified by get_active_patient()
-            # (locked to the Access window that was in the foreground).
-            # Only fall back to DB search when the instance could not be
-            # determined from the COM object — this prevents cross-instance
-            # contamination when the same patient code exists in both bases.
             instance = patient.get("instance")
             if instance is not None:
                 log.info(
@@ -878,7 +960,7 @@ def worker(file_queue: queue.Queue) -> None:
             else:
                 log.warning(
                     f"Could not lock instance from active window for patient "
-                    f"{patient['code']} — falling back to DB search."
+                    f"{patient['code']} — falling back to stratégie Dr/Médecins."
                 )
                 instance = find_instance_for_patient(patient["code"])
 
@@ -1034,6 +1116,7 @@ def main() -> None:
         log.info(f"  [{inst.name}]  exe={inst.exe}  mdb={inst.public_mdb}")
     log.info(f"  Timeout : {PATIENT_WAIT_TIMEOUT // 60} min")
     log.info(f"  Ext     : {', '.join(sorted(WATCHED_EXTENSIONS))}")
+    log.info(f"  Dr→Instance : {DOCTOR_NAME_TO_INSTANCE}")
 
     file_queue: queue.Queue = queue.Queue()
 

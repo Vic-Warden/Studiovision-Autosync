@@ -219,35 +219,36 @@ def _quit(icon, item) -> None:        # noqa: ARG001
 
 
 # ── Instance selector menu items ──────────────────────────────────────────────
+#
+# pystray _assert_action rejects closures/lambdas on older versions.
+# Bound methods of a class pass the check unconditionally.
 
-def _make_instance_action(name: str):
-    """Return a proper callable (not a lambda) for the given instance name."""
-    def _action(icon, item):   # noqa: ARG001
-        set_selected_instance(name)
-    _action.__name__ = f"_select_{name}"
-    return _action
+class _InstanceMenuHandler:
+    """One handler per StudioVision instance; bound methods used as callbacks."""
+    def __init__(self, name: str) -> None:
+        self._name = name
 
+    def action(self, icon, item) -> None:   # noqa: ARG002
+        set_selected_instance(self._name)
 
-def _make_instance_checked(name: str):
-    """Return a proper callable that returns True when name is selected."""
-    def _checked(item):   # noqa: ARG001
+    def checked(self, item) -> bool:        # noqa: ARG002
         with _instance_lock:
-            return _selected_instance_name == name
-    _checked.__name__ = f"_checked_{name}"
-    return _checked
+            return _selected_instance_name == self._name
+
+
+# Pre-build handlers so they stay alive for the lifetime of the process.
+_INSTANCE_HANDLERS: dict[str, "_InstanceMenuHandler"] = {
+    inst.name: _InstanceMenuHandler(inst.name) for inst in INSTANCES
+}
 
 
 def _make_instance_menu() -> "pystray.Menu":
-    """
-    Build a radio-style sub-menu with one checked item per instance.
-    Each action/checked callback must be a named function — pystray
-    rejects lambdas and closures defined inline in MenuItem().
-    """
+    """Radio-style sub-menu — one entry per instance, bound methods only."""
     items = [
         pystray.MenuItem(
             text=f"Base : {inst.name}",
-            action=_make_instance_action(inst.name),
-            checked=_make_instance_checked(inst.name),
+            action=_INSTANCE_HANDLERS[inst.name].action,
+            checked=_INSTANCE_HANDLERS[inst.name].checked,
             radio=True,
         )
         for inst in INSTANCES

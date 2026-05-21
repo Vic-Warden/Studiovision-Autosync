@@ -148,6 +148,7 @@ _status_text: str             = "Starting..."
 _stop_event: threading.Event  = threading.Event()
 _mutex_handle                 = None
 
+# ── Selected instance (protected by _instance_lock) ──────────────────────────
 _selected_instance_name: str      = _DEFAULT_INSTANCE_NAME
 _instance_lock:          threading.Lock = threading.Lock()
 
@@ -163,7 +164,7 @@ def set_selected_instance(name: str) -> None:
     global _selected_instance_name
     with _instance_lock:
         _selected_instance_name = name
-    log.info(f"Instance selected: [{name}]")
+    log.info(f"BDD sélectionnée : [{name}]")
     _set_status(f"{BOX_NAME} — BDD : {name}", processing=False)
     if _icon is not None:
         try:
@@ -171,6 +172,8 @@ def set_selected_instance(name: str) -> None:
         except Exception as e:
             log.debug(f"Menu update failed: {e}")
 
+
+# ── Tray helpers ──────────────────────────────────────────────────────────────
 
 def _make_icon(color: tuple) -> "Image.Image":
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
@@ -215,33 +218,44 @@ def _quit(icon, item) -> None:        # noqa: ARG001
     icon.stop()
 
 
+# ── Instance selector menu items ──────────────────────────────────────────────
+
+def _make_instance_action(name: str):
+    """Return a proper callable (not a lambda) for the given instance name."""
+    def _action(icon, item):   # noqa: ARG001
+        set_selected_instance(name)
+    _action.__name__ = f"_select_{name}"
+    return _action
+
+
+def _make_instance_checked(name: str):
+    """Return a proper callable that returns True when name is selected."""
+    def _checked(item):   # noqa: ARG001
+        with _instance_lock:
+            return _selected_instance_name == name
+    _checked.__name__ = f"_checked_{name}"
+    return _checked
+
+
 def _make_instance_menu() -> "pystray.Menu":
     """
-    Build a radio-style sub-menu with one item per instance.
-    pystray has no native radio buttons, so we simulate them with a
-    checked=True/False callback and the radio=True flag.
+    Build a radio-style sub-menu with one checked item per instance.
+    Each action/checked callback must be a named function — pystray
+    rejects lambdas and closures defined inline in MenuItem().
     """
-    items = []
-    for inst in INSTANCES:
-        name = inst.name  # capture in closure
-
-        def _action(icon, item, _name=name):   # noqa: ARG001
-            set_selected_instance(_name)
-
-        def _checked(item, _name=name):
-            with _instance_lock:
-                return _selected_instance_name == _name
-
-        items.append(
-            pystray.MenuItem(
-                text=f"Base : {name}",
-                action=_action,
-                checked=_checked,
-                radio=True,
-            )
+    items = [
+        pystray.MenuItem(
+            text=f"Base : {inst.name}",
+            action=_make_instance_action(inst.name),
+            checked=_make_instance_checked(inst.name),
+            radio=True,
         )
+        for inst in INSTANCES
+    ]
     return pystray.Menu(*items)
 
+
+# ── Network / DB helpers ──────────────────────────────────────────────────────
 
 def wait_for_network_share() -> None:
     is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
@@ -492,6 +506,8 @@ def refresh_ui(expected_patient_code: "str | None" = None) -> None:
         log.warning(f"COM refresh failed (non-blocking): {e}")
 
 
+# ── File helpers ──────────────────────────────────────────────────────────────
+
 def wait_for_file(file: Path) -> bool:
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
@@ -527,6 +543,8 @@ def orphan_file(file: Path) -> None:
     move_file(file, ORPHAN_DIR, label="ORPHAN")
 
 
+# ── Worker ────────────────────────────────────────────────────────────────────
+
 def prevent_sleep() -> None:
     try:
         ctypes.windll.kernel32.SetThreadExecutionState(
@@ -558,7 +576,7 @@ def worker(file_queue: queue.Queue) -> None:
                         f"Envoi dans la BDD de {instance.name} "
                         f"({burst_count} fichier(s))"
                     )
-                    log.info(f"Burst complete — {msg}")
+                    log.info(f"Burst complet — {msg}")
                     refresh_ui(expected_patient_code=last_patient_code)
                     needs_refresh = False
                     last_patient_code = None
@@ -597,6 +615,7 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
+            # ── Read the patient code from the active Access window ────────
             patient    = None
             start_time = time.monotonic()
             first_log  = True
@@ -616,8 +635,8 @@ def worker(file_queue: queue.Queue) -> None:
 
                 if first_log:
                     log.info(
-                        f"No patient open, waiting "
-                        f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
+                        f"Aucun patient ouvert, en attente "
+                        f"(timeout dans {PATIENT_WAIT_TIMEOUT // 60} min)"
                     )
                     first_log = False
 
@@ -627,12 +646,12 @@ def worker(file_queue: queue.Queue) -> None:
                 continue
 
             log.info(
-                f"Patient: {patient['nom']} {patient['prenom']} "
-                f"(code {patient['code']}) -> instance [{instance.name}]"
+                f"Patient : {patient['nom']} {patient['prenom']} "
+                f"(code {patient['code']}) → BDD [{instance.name}]"
             )
 
-            # The tray selection is the sole source of truth for routing;
-            # no automatic detection is performed.
+            # ── Route to the explicitly selected instance ──────────────────
+            # (no automatic detection — the user's tray choice is the only source of truth)
 
             patient_folder = find_patient_folder(patient["code"], instance)
             if not patient_folder:
@@ -659,11 +678,11 @@ def worker(file_queue: queue.Queue) -> None:
                 last_patient_code = patient["code"]
                 burst_count      += 1
                 log.debug(
-                    f"Insert OK in [{instance.name}] — "
-                    "needs_refresh=True (refresh deferred to burst end)."
+                    f"Insert OK dans [{instance.name}] — "
+                    "needs_refresh=True (refresh différé à la fin du burst)."
                 )
             else:
-                log.warning("Insert failed, refresh flag unchanged.")
+                log.warning("Insert échoué, refresh flag inchangé.")
                 _notify("Erreur BDD", "Insertion échouée — consultez les logs")
 
             file_queue.task_done()
@@ -672,8 +691,8 @@ def worker(file_queue: queue.Queue) -> None:
         if needs_refresh:
             instance = get_selected_instance()
             log.info(
-                f"Worker shutting down — flushing pending UI refresh "
-                f"(instance [{instance.name}])."
+                f"Worker s'arrête — flush du refresh UI en attente "
+                f"(BDD [{instance.name}])."
             )
             refresh_ui(expected_patient_code=last_patient_code)
             if burst_count:
@@ -682,6 +701,8 @@ def worker(file_queue: queue.Queue) -> None:
         _set_status(f"{BOX_NAME} — Arrêté")
         pythoncom.CoUninitialize()
 
+
+# ── File watcher ──────────────────────────────────────────────────────────────
 
 class ImageProducer(FileSystemEventHandler):
     def __init__(self, file_queue: queue.Queue) -> None:
@@ -716,7 +737,7 @@ def _run_background(file_queue: queue.Queue) -> None:
         while not _stop_event.is_set():
             if not observer.is_alive():
                 log.warning("Observer has stopped (network drop?). Attempting reconnect...")
-                _set_status(f"{BOX_NAME} — Reconnecting...", processing=False)
+                _set_status(f"{BOX_NAME} — Reconnexion...", processing=False)
                 try:
                     observer.stop()
                     observer.join(timeout=5)
@@ -740,6 +761,8 @@ def _run_background(file_queue: queue.Queue) -> None:
         if _icon is not None:
             _icon.stop()
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     global _icon, _mutex_handle
@@ -779,10 +802,10 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("MULTI-INSTANCE version started (manual database selection)")
-    log.info(f"  Source   : {SOURCE_DIR}")
-    log.info(f"  Orphans  : {ORPHAN_DIR}")
-    log.info(f"  Default  : {_DEFAULT_INSTANCE_NAME}")
+    log.info("MULTI-INSTANCE version started (sélection manuelle de la BDD)")
+    log.info(f"  Source      : {SOURCE_DIR}")
+    log.info(f"  Orphelins   : {ORPHAN_DIR}")
+    log.info(f"  BDD défaut  : {_DEFAULT_INSTANCE_NAME}")
     for inst in INSTANCES:
         log.info(f"  [{inst.name}]  exe={inst.exe}  mdb={inst.public_mdb}")
     log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
@@ -809,13 +832,16 @@ def main() -> None:
             _stop_event.set()
         return
 
+    # ── Build pystray menu ────────────────────────────────────────────────
     menu = pystray.Menu(
+        # Non-clickable status line
         pystray.MenuItem(
             text=lambda item: _status_text,
             action=None,
             enabled=False,
         ),
         pystray.Menu.SEPARATOR,
+        # Radio-style instance selector
         pystray.MenuItem(
             "Base de données",
             _make_instance_menu(),

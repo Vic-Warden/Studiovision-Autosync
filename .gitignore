@@ -9,3 +9,5 @@ tests/.DS_Store
 
 # Ignore all files in tests/
 tests/*
+
+.DS_Store

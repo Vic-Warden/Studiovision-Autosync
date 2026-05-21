@@ -2,9 +2,9 @@
 Routes incoming imaging files to the correct patient folder,
 inserts a DB record, and refreshes the Access UI.
 
-MULTI-INSTANCE VERSION: a single program monitors SOURCE_DIR and automatically
-determines which StudioVision instance has the patient open (Megret or Romoli).
-The instance with the active patient record receives the file.
+MULTI-INSTANCE VERSION: a single program monitors SOURCE_DIR and routes files
+to the instance (Megret or Romoli) explicitly selected by the user via the
+system tray menu. No automatic detection of the active instance is performed.
 
 Pipeline: PollingObserver → file_queue → Worker → Access DB + UI refresh
           (1.5 s burst debounce, auto-reconnect on network drop)
@@ -85,13 +85,6 @@ EXAM_DESCRIPTION = {
     ".odt":  "Document",
 }
 
-DOCTOR_NAME_TO_INSTANCE: dict[str, str] = {
-    "OM":  "Megret",
-    "OMB": "Megret",
-    "HR":  "Romoli",
-    "HRB": "Romoli",
-}
-
 
 @dataclass
 class Instance:
@@ -118,6 +111,12 @@ INSTANCES: list[Instance] = [
         docum_mdb   = Path(r"\\studiovision\Studiov2000-OM\fichier\DOCUM.MDB"),
     ),
 ]
+
+# Build a quick lookup by name for the menu handlers.
+INSTANCES_BY_NAME: dict[str, Instance] = {inst.name: inst for inst in INSTANCES}
+
+# Default instance selected at startup (Megret).
+_DEFAULT_INSTANCE_NAME = "Megret"
 
 # Used for the double-click guard: block launch if any known SV process is running.
 _ALL_SV_EXES = {inst.exe.lower() for inst in INSTANCES}
@@ -148,6 +147,29 @@ _icon: "pystray.Icon | None" = None
 _status_text: str             = "Starting..."
 _stop_event: threading.Event  = threading.Event()
 _mutex_handle                 = None
+
+_selected_instance_name: str      = _DEFAULT_INSTANCE_NAME
+_instance_lock:          threading.Lock = threading.Lock()
+
+
+def get_selected_instance() -> Instance:
+    """Return the Instance currently selected in the tray menu (thread-safe)."""
+    with _instance_lock:
+        return INSTANCES_BY_NAME[_selected_instance_name]
+
+
+def set_selected_instance(name: str) -> None:
+    """Switch the active instance and update tray status (thread-safe)."""
+    global _selected_instance_name
+    with _instance_lock:
+        _selected_instance_name = name
+    log.info(f"Instance selected: [{name}]")
+    _set_status(f"{BOX_NAME} — BDD : {name}", processing=False)
+    if _icon is not None:
+        try:
+            _icon.update_menu()
+        except Exception as e:
+            log.debug(f"Menu update failed: {e}")
 
 
 def _make_icon(color: tuple) -> "Image.Image":
@@ -193,6 +215,34 @@ def _quit(icon, item) -> None:        # noqa: ARG001
     icon.stop()
 
 
+def _make_instance_menu() -> "pystray.Menu":
+    """
+    Build a radio-style sub-menu with one item per instance.
+    pystray has no native radio buttons, so we simulate them with a
+    checked=True/False callback and the radio=True flag.
+    """
+    items = []
+    for inst in INSTANCES:
+        name = inst.name  # capture in closure
+
+        def _action(icon, item, _name=name):   # noqa: ARG001
+            set_selected_instance(_name)
+
+        def _checked(item, _name=name):
+            with _instance_lock:
+                return _selected_instance_name == _name
+
+        items.append(
+            pystray.MenuItem(
+                text=f"Base : {name}",
+                action=_action,
+                checked=_checked,
+                radio=True,
+            )
+        )
+    return pystray.Menu(*items)
+
+
 def wait_for_network_share() -> None:
     is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
     if not is_network:
@@ -213,154 +263,6 @@ def db_connect(mdb_path: Path):
     return pyodbc.connect(
         f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
     )
-
-
-def patient_exists_in_db(patient_code: str, instance: Instance) -> bool:
-    """Return True if the patient code exists in this instance's PUBLIC.MDB."""
-    if not PYODBC_AVAILABLE:
-        return False
-    if not instance.public_mdb.exists():
-        log.debug(f"[{instance.name}] PUBLIC.MDB not accessible: {instance.public_mdb}")
-        return False
-    try:
-        conn   = db_connect(instance.public_mdb)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT TOP 1 [code patient] FROM Documents WHERE [code patient] = ?",
-            (int(patient_code),)
-        )
-        row = cursor.fetchone()
-        conn.close()
-        return row is not None
-    except Exception as e:
-        log.debug(f"[{instance.name}] patient_exists_in_db error: {e}")
-        return False
-
-
-def find_instance_from_last_consult(patient_code: str) -> "Instance | None":
-    if not PYODBC_AVAILABLE:
-        return None
-
-    @dataclass
-    class ConsultResult:
-        inst:     Instance
-        date:     datetime
-        dr_name:  str | None
-        resolved: "Instance | None"  # instance déduite du Dr, ou None si neutre
-
-    results: list[ConsultResult] = []
-
-    for inst in INSTANCES:
-        if not inst.public_mdb.exists():
-            log.debug(f"[{inst.name}] PUBLIC.MDB inaccessible.")
-            continue
-        try:
-            conn   = db_connect(inst.public_mdb)
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT TOP 1
-                    c.[Date],
-                    m.[Name]
-                FROM [Consultations] AS c
-                LEFT JOIN [Médecins] AS m
-                    ON m.[ID] = c.[Code Médecin]
-                WHERE c.[Code patient] = ?
-                  AND c.[Code Médecin] IS NOT NULL
-                ORDER BY c.[Date] DESC
-                """,
-                (int(patient_code),),
-            )
-            row = cursor.fetchone()
-            conn.close()
-
-            if not row or not row[0]:
-                log.debug(f"[{inst.name}] Aucune consultation pour patient {patient_code}.")
-                continue
-
-            record_date = (
-                row[0] if isinstance(row[0], datetime)
-                else datetime.fromisoformat(str(row[0]))
-            )
-            dr_name  = str(row[1]).strip().upper() if row[1] else None
-            target   = DOCTOR_NAME_TO_INSTANCE.get(dr_name) if dr_name else None
-            resolved = next((i for i in INSTANCES if i.name == target), None) if target else None
-
-            log.debug(
-                f"[{inst.name}] Dernière consult : "
-                f"Date={record_date:%Y-%m-%d}  Dr={dr_name}  → résolu={target}"
-            )
-            results.append(ConsultResult(inst, record_date, dr_name, resolved))
-
-        except Exception as e:
-            log.debug(f"[{inst.name}] Erreur lecture Consultations : {e}")
-
-    if not results:
-        log.warning(f"Aucune consultation trouvée pour patient {patient_code}.")
-        return None
-
-    # Trier par date décroissante — le record le plus récent est la source de vérité.
-    results.sort(key=lambda r: r.date, reverse=True)
-    best = results[0]
-
-    if best.resolved is not None:
-        log.info(
-            f"Instance résolue via Dr '{best.dr_name}' "
-            f"(date={best.date:%Y-%m-%d}, base=[{best.inst.name}]) "
-            f"→ [{best.resolved.name}]"
-        )
-        return best.resolved
-
-    # Dr neutre (PHF, LM, CS…) : on retourne l'instance dont la base
-    # contient le record le plus récent — meilleure heuristique disponible.
-    log.warning(
-        f"Dr neutre '{best.dr_name}' pour patient {patient_code} "
-        f"— fallback sur la base la plus récente : [{best.inst.name}] "
-        f"(date={best.date:%Y-%m-%d})"
-    )
-    return best.inst
-
-
-def find_instance_for_patient(patient_code: str) -> "Instance | None":
-    """
-    Détermine l'instance active pour un patient donné.
-
-    Stratégie (ordre de priorité) :
-      1. Lecture du Dr du dernier acte via jointure Médecins → le champ Name
-         (OM/OMB → Megret, HR/HRB → Romoli) est la source de vérité.
-         La base avec la consultation la plus récente l'emporte quand les
-         deux bases contiennent le même patient (OM copie souvent HR).
-      2. Fallback : recherche dans les bases des instances actives
-         (comportement d'origine, conservé si la table Consultations est
-         inaccessible ou ne contient aucune ligne pour ce patient).
-    """
-    # --- Stratégie 1 : Dr du dernier acte -----------------------------------
-    inst = find_instance_from_last_consult(patient_code)
-    if inst is not None:
-        return inst
-
-    log.warning(
-        f"Stratégie Dr échouée pour le patient {patient_code} — "
-        "repli sur la détection par processus/base."
-    )
-
-    # --- Stratégie 2 (fallback) : instances avec processus actif -----------
-    running_exes = {
-        (p.info["name"] or "").lower()
-        for p in psutil.process_iter(["name"])
-    }
-    active_instances = [i for i in INSTANCES if i.exe.lower() in running_exes]
-    if not active_instances:
-        log.warning("Aucun processus StudioVision détecté — recherche dans toutes les bases.")
-        active_instances = INSTANCES
-
-    for inst in active_instances:
-        if patient_exists_in_db(patient_code, inst):
-            log.info(f"Patient {patient_code} trouvé dans l'instance [{inst.name}] (fallback).")
-            return inst
-
-    log.warning(f"Patient {patient_code} introuvable dans toutes les instances.")
-    return None
 
 
 def find_patient_folder(patient_code: str, instance: Instance) -> "Path | None":
@@ -453,71 +355,6 @@ def _find_sfdoc(form):
     return None
 
 
-def _instance_from_access_path(db_path: str) -> "Instance | None":
-    """
-    Given the CurrentDb path reported by an Access COM object,
-    return the matching Instance by comparing exact folder names.
-    """
-    norm = db_path.lower().replace("/", "\\")
-    for inst in INSTANCES:
-        folder = inst.dest_photos.parent.name.lower()
-        folder_pattern = f"\\{folder}\\"
-        if folder_pattern in norm:
-            return inst
-    return None
-
-
-def _instance_from_window_title(title: str) -> "Instance | None":
-    title_lower = title.lower()
-    sorted_instances = sorted(INSTANCES, key=lambda i: len(i.dest_photos.parent.name), reverse=True)
-
-    for inst in sorted_instances:
-        folder = inst.dest_photos.parent.name.lower()
-        if folder in title_lower:
-            return inst
-    return None
-
-
-def _get_access_pids() -> dict[int, str]:
-    """
-    Return {pid: window_title} for every visible Access top-level window.
-    Uses EnumWindows so we can resolve which Access process owns which window.
-    """
-    import win32gui
-    import win32process
-
-    result: dict[int, str] = {}
-
-    def _cb(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        title = win32gui.GetWindowText(hwnd)
-        if not title:
-            return
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        except Exception:
-            return
-        # Only keep Access windows (check via psutil later)
-        result[hwnd] = (pid, title)
-
-    win32gui.EnumWindows(_cb, None)
-
-    # Filter to msaccess.exe PIDs
-    access_pids: dict[int, str] = {}
-    try:
-        pid_to_name = {p.info["pid"]: (p.info["name"] or "").lower()
-                       for p in psutil.process_iter(["pid", "name"])}
-    except Exception:
-        return {}
-
-    for hwnd, (pid, title) in result.items():
-        if "msaccess" in pid_to_name.get(pid, ""):
-            access_pids[pid] = title  # last window per PID wins — usually the main one
-
-    return access_pids  # {pid: window_title}
-
-
 def _read_patient_from_access(access_app) -> "dict | None":
     """Extract patient fields from the active form of a given Access COM object."""
     try:
@@ -548,200 +385,28 @@ def _read_patient_from_access(access_app) -> "dict | None":
     }
 
 
-def _get_access_com_objects() -> list[tuple[object, int]]:
-    """
-    Return a list of (Access COM object, pid) for every running msaccess.exe.
-
-    Technique: iterate psutil for msaccess PIDs, then use
-    win32com.client.GetObject with the process handle trick via
-    AccessibleObjectFromWindow on the main Access hwnd.
-    Fallback: GetActiveObject for a single instance.
-    """
-    import win32gui
-    import win32process
-    import win32com.client
-
-    results: list[tuple[object, int]] = []
-
-    # Map Access window titles by PID so we can later resolve instance from window title.
-    access_pid_titles: dict[int, str] = {}
-    try:
-        def _cb(hwnd, _):
-            if not win32gui.IsWindowVisible(hwnd):
-                return
-            title = win32gui.GetWindowText(hwnd)
-            if not title:
-                return
-            try:
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                access_pid_titles[pid] = title
-            except Exception:
-                pass
-        win32gui.EnumWindows(_cb, None)
-    except Exception as e:
-        log.debug(f"EnumWindows failed: {e}")
-
-    # Get all msaccess PIDs
-    access_pids = [
-        p.info["pid"]
-        for p in psutil.process_iter(["pid", "name"])
-        if "msaccess" in (p.info["name"] or "").lower()
-    ]
-
-    if not access_pids:
-        return results
-
-    if len(access_pids) == 1:
-        # Single Access process — avoid the more complex multi-instance path.
-        try:
-            access = win32com.client.GetActiveObject("Access.Application")
-            results.append((access, access_pids[0]))
-        except Exception as e:
-            log.debug(f"GetActiveObject failed: {e}")
-        return results
-
-    # Multiple instances: bind each Access window via its HWND using the
-    # "OMain" window class, which is the top-level frame for every Access instance.
-    OBJID_NATIVEOM = -16  # OBJID_NATIVEOM constant
-    try:
-        import ctypes
-        import ctypes.wintypes
-
-        acc_hwnds: list[tuple[int, int]] = []  # (hwnd, pid)
-
-        def _find_access_main(hwnd, _):
-            cls = win32gui.GetClassName(hwnd)
-            if cls == "OMain":
-                try:
-                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    acc_hwnds.append((hwnd, pid))
-                except Exception:
-                    pass
-
-        win32gui.EnumWindows(_find_access_main, None)
-
-        IID_IDispatch = "{00020400-0000-0000-C000-000000000046}"
-        ole32 = ctypes.oledll.oleacc
-
-        for hwnd, pid in acc_hwnds:
-            try:
-                ptr = ctypes.c_void_p()
-                riid = pythoncom.MakeIID(IID_IDispatch)
-                # AccessibleObjectFromWindow(hwnd, OBJID_NATIVEOM, IID_IDispatch, &ptr)
-                hr = ctypes.windll.oleacc.AccessibleObjectFromWindow(
-                    hwnd,
-                    ctypes.c_uint32(0xFFFFFFF0),  # OBJID_NATIVEOM
-                    ctypes.byref(pythoncom.MakeIID(IID_IDispatch)
-                                 if False else ctypes.create_string_buffer(16)),
-                    ctypes.byref(ptr),
-                )
-                # Low-level OBJID_NATIVEOM binding is fragile across Office versions;
-                # fall through to the simpler GetObject moniker approach below.
-            except Exception:
-                pass
-
-        # Office supports a "!hwnd" moniker syntax that returns the document
-        # COM object for a specific window handle, avoiding GetActiveObject
-        # which always returns the same (last registered) instance.
-        for hwnd, pid in acc_hwnds:
-            try:
-                access = win32com.client.GetObject(f"!{hwnd}")
-                # GetObject with an hwnd moniker returns the document; navigate up to Application.
-                try:
-                    app = access.Application
-                except Exception:
-                    app = access
-                results.append((app, pid))
-                log.debug(f"Bound Access COM via hwnd {hwnd} (pid={pid})")
-            except Exception as e:
-                log.debug(f"GetObject(!{hwnd}) failed: {e}")
-
-        if results:
-            return results
-
-    except Exception as e:
-        log.debug(f"Multi-instance COM binding failed: {e}")
-
-    # Last resort: GetActiveObject always returns the same registered instance,
-    # so this only works correctly when a single Access process is running.
-    try:
-        access = win32com.client.GetActiveObject("Access.Application")
-        pid    = access_pids[0] if access_pids else 0
-        results.append((access, pid))
-    except Exception as e:
-        log.debug(f"GetActiveObject fallback failed: {e}")
-
-    return results
-
-
 def get_active_patient() -> "dict | None":
+    """
+    Read the patient currently open in any running Access window.
+    Returns only the patient record (code, nom, prénom).
+    Instance routing is handled separately via the tray menu selection.
+    """
     if not WIN32_AVAILABLE:
         return None
 
-    import win32gui
-    import win32process
-
-    fg_access_pid: int | None = None
     try:
-        fg_hwnd = win32gui.GetForegroundWindow()
-        if fg_hwnd:
-            _, fg_pid = win32process.GetWindowThreadProcessId(fg_hwnd)
-            for p in psutil.process_iter(["pid", "name"]):
-                if p.info["pid"] == fg_pid and "msaccess" in (p.info["name"] or "").lower():
-                    fg_access_pid = fg_pid
-                    break
+        access = win32com.client.GetActiveObject("Access.Application")
     except Exception as e:
-        log.debug(f"Foreground PID detection failed: {e}")
-
-    log.debug(f"Foreground Access PID: {fg_access_pid}")
-
-    com_objects = _get_access_com_objects()
-    if not com_objects:
-        log.debug("No Access COM objects found.")
+        log.debug(f"GetActiveObject failed: {e}")
         return None
 
-    best_patient:  dict | None     = None
-    best_instance: Instance | None = None
-    best_is_fg:    bool            = False
-
-    for access, pid in com_objects:
-        # Identify instance from CurrentDb path
-        inst: Instance | None = None
-        try:
-            db_path = access.CurrentDb().Name
-            inst    = _instance_from_access_path(db_path)
-            log.debug(f"Access pid={pid} db={db_path} → instance={inst.name if inst else 'unknown'}")
-        except Exception as e:
-            log.debug(f"CurrentDb() failed for pid={pid}: {e}")
-
-        patient = _read_patient_from_access(access)
-        if patient is None:
-            log.debug(f"No active patient in Access pid={pid}")
-            continue
-
-        patient["instance"] = inst
-        is_fg = (fg_access_pid is not None and pid == fg_access_pid)
-
-        log.debug(
-            f"Patient found: code={patient['code']} pid={pid} "
-            f"instance={inst.name if inst else 'unknown'} fg={is_fg}"
-        )
-
-        if is_fg or best_patient is None:
-            best_patient  = patient
-            best_instance = inst
-            best_is_fg    = is_fg
-            if is_fg:
-                break  # foreground match — no need to look further
-
-    if best_patient is not None:
+    patient = _read_patient_from_access(access)
+    if patient:
         log.info(
-            f"Active patient: {best_patient['nom']} {best_patient['prenom']} "
-            f"(code {best_patient['code']}) "
-            f"instance={best_instance.name if best_instance else 'unknown'} "
-            f"fg={best_is_fg}"
+            f"Active patient: {patient['nom']} {patient['prenom']} "
+            f"(code {patient['code']})"
         )
-    return best_patient
+    return patient
 
 
 def refresh_ui(expected_patient_code: "str | None" = None) -> None:
@@ -888,23 +553,38 @@ def worker(file_queue: queue.Queue) -> None:
                 file: Path = file_queue.get(timeout=1.5)
             except queue.Empty:
                 if needs_refresh:
-                    log.info("Burst complete — triggering batched UI refresh.")
+                    instance = get_selected_instance()
+                    msg = (
+                        f"Envoi dans la BDD de {instance.name} "
+                        f"({burst_count} fichier(s))"
+                    )
+                    log.info(f"Burst complete — {msg}")
                     refresh_ui(expected_patient_code=last_patient_code)
                     needs_refresh = False
                     last_patient_code = None
-                    _notify("Transfer complete", f"{burst_count} file(s) processed")
-                    _set_status(f"{BOX_NAME} — Ready", processing=False)
+                    _notify(f"BDD {instance.name} — Transfert terminé", msg)
+                    _set_status(f"{BOX_NAME} — BDD : {instance.name} — Prêt", processing=False)
                     burst_count = 0
                 continue
             except Exception as e:
                 log.error(f"Queue error: {e}")
                 continue
 
-            log.info(f"Processing: {file.name} ({file_queue.qsize()} pending)")
+            instance = get_selected_instance()
+            log.info(
+                f"Processing: {file.name} ({file_queue.qsize()} pending) "
+                f"→ BDD [{instance.name}]"
+            )
 
             if burst_count == 0 and not needs_refresh:
-                _notify("Transfer in progress", file.name)
-            _set_status("Transfer in progress...", processing=True)
+                _notify(
+                    f"BDD {instance.name} — Transfert en cours",
+                    file.name,
+                )
+            _set_status(
+                f"Envoi dans la BDD de {instance.name}...",
+                processing=True,
+            )
 
             if not file.exists():
                 log.warning(f"File gone before processing: {file}")
@@ -913,7 +593,7 @@ def worker(file_queue: queue.Queue) -> None:
 
             if not wait_for_file(file):
                 log.error(f"Aborting, persistent lock: {file.name}")
-                _notify("Error", f"File locked: {file.name}")
+                _notify("Erreur", f"Fichier verrouillé : {file.name}")
                 file_queue.task_done()
                 continue
 
@@ -929,7 +609,7 @@ def worker(file_queue: queue.Queue) -> None:
                 elapsed = time.monotonic() - start_time
                 if elapsed >= PATIENT_WAIT_TIMEOUT:
                     orphan_file(file)
-                    _notify("Orphan file", file.name)
+                    _notify("Fichier orphelin", file.name)
                     file_queue.task_done()
                     patient = None
                     break
@@ -948,31 +628,11 @@ def worker(file_queue: queue.Queue) -> None:
 
             log.info(
                 f"Patient: {patient['nom']} {patient['prenom']} "
-                f"(code {patient['code']})"
+                f"(code {patient['code']}) -> instance [{instance.name}]"
             )
 
-            instance = patient.get("instance")
-            if instance is not None:
-                log.info(
-                    f"Instance locked from active window: [{instance.name}] "
-                    f"(patient {patient['code']})"
-                )
-            else:
-                log.warning(
-                    f"Could not lock instance from active window for patient "
-                    f"{patient['code']} — falling back to stratégie Dr/Médecins."
-                )
-                instance = find_instance_for_patient(patient["code"])
-
-            if instance is None:
-                log.error(
-                    f"Patient {patient['code']} not found in any instance. "
-                    "Orphaning."
-                )
-                orphan_file(file)
-                _notify("Orphan file", file.name)
-                file_queue.task_done()
-                continue
+            # The tray selection is the sole source of truth for routing;
+            # no automatic detection is performed.
 
             patient_folder = find_patient_folder(patient["code"], instance)
             if not patient_folder:
@@ -981,7 +641,7 @@ def worker(file_queue: queue.Queue) -> None:
                     "Orphaning."
                 )
                 orphan_file(file)
-                _notify("Orphan file", file.name)
+                _notify("Fichier orphelin", file.name)
                 file_queue.task_done()
                 continue
 
@@ -998,20 +658,28 @@ def worker(file_queue: queue.Queue) -> None:
                 needs_refresh     = True
                 last_patient_code = patient["code"]
                 burst_count      += 1
-                log.debug("Insert OK — needs_refresh=True (refresh deferred to burst end).")
+                log.debug(
+                    f"Insert OK in [{instance.name}] — "
+                    "needs_refresh=True (refresh deferred to burst end)."
+                )
             else:
                 log.warning("Insert failed, refresh flag unchanged.")
-                _notify("DB Error", "Insert failed — check logs")
+                _notify("Erreur BDD", "Insertion échouée — consultez les logs")
 
             file_queue.task_done()
 
     finally:
         if needs_refresh:
-            log.info("Worker shutting down — flushing pending UI refresh.")
+            instance = get_selected_instance()
+            log.info(
+                f"Worker shutting down — flushing pending UI refresh "
+                f"(instance [{instance.name}])."
+            )
             refresh_ui(expected_patient_code=last_patient_code)
             if burst_count:
-                _notify("Transfer complete", f"{burst_count} file(s) processed")
-        _set_status(f"{BOX_NAME} — Stopped")
+                msg = f"Envoi dans la BDD de {instance.name} ({burst_count} fichier(s))"
+                _notify(f"BDD {instance.name} — Transfert terminé", msg)
+        _set_status(f"{BOX_NAME} — Arrêté")
         pythoncom.CoUninitialize()
 
 
@@ -1041,7 +709,8 @@ def _run_background(file_queue: queue.Queue) -> None:
         return obs
 
     observer = _start_observer()
-    _set_status(f"{BOX_NAME} — Ready", processing=False)
+    inst = get_selected_instance()
+    _set_status(f"{BOX_NAME} — BDD : {inst.name} — Prêt", processing=False)
 
     try:
         while not _stop_event.is_set():
@@ -1057,7 +726,8 @@ def _run_background(file_queue: queue.Queue) -> None:
                 log.info(f"Waiting {_RECONNECT_WAIT}s before restarting observer...")
                 time.sleep(_RECONNECT_WAIT)
                 observer = _start_observer()
-                _set_status(f"{BOX_NAME} — Ready", processing=False)
+                inst = get_selected_instance()
+                _set_status(f"{BOX_NAME} — BDD : {inst.name} — Prêt", processing=False)
             time.sleep(1)
     finally:
         observer.stop()
@@ -1109,14 +779,14 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("MULTI-INSTANCE version started")
-    log.info(f"  Source  : {SOURCE_DIR}")
-    log.info(f"  Orphans : {ORPHAN_DIR}")
+    log.info("MULTI-INSTANCE version started (manual database selection)")
+    log.info(f"  Source   : {SOURCE_DIR}")
+    log.info(f"  Orphans  : {ORPHAN_DIR}")
+    log.info(f"  Default  : {_DEFAULT_INSTANCE_NAME}")
     for inst in INSTANCES:
         log.info(f"  [{inst.name}]  exe={inst.exe}  mdb={inst.public_mdb}")
-    log.info(f"  Timeout : {PATIENT_WAIT_TIMEOUT // 60} min")
-    log.info(f"  Ext     : {', '.join(sorted(WATCHED_EXTENSIONS))}")
-    log.info(f"  Dr→Instance : {DOCTOR_NAME_TO_INSTANCE}")
+    log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
+    log.info(f"  Extensions  : {', '.join(sorted(WATCHED_EXTENSIONS))}")
 
     file_queue: queue.Queue = queue.Queue()
 
@@ -1146,8 +816,13 @@ def main() -> None:
             enabled=False,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Open logs", _open_logs),
-        pystray.MenuItem("Quit", _quit),
+        pystray.MenuItem(
+            "Base de données",
+            _make_instance_menu(),
+        ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Ouvrir les logs", _open_logs),
+        pystray.MenuItem("Quitter", _quit),
     )
 
     _icon = pystray.Icon(

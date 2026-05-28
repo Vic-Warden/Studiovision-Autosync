@@ -23,15 +23,6 @@ Usage (from the provided .bat files):
     pythonw studiovision_monitor_multi.py --mode HR
 
 Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
-
-CHANGES v2:
-  - Fix COM: use ROT enumeration to find the correct Access instance
-    (by matching CurrentProject.FullName to the instance MDE path).
-    Works even when both OM and HR StudioVision are open simultaneously.
-  - Fix patient validation: before copying/inserting, verify that the
-    patient code EXISTS in the target PUBLIC.MDB. If not → orphan.
-    This prevents sending HR patient images into the OM database and
-    vice-versa.
 """
 
 import argparse
@@ -54,7 +45,6 @@ from watchdog.events import FileSystemEventHandler
 
 try:
     import win32com.client
-    import win32com.client.gencache
     WIN32_AVAILABLE = True
 except ImportError:
     WIN32_AVAILABLE = False
@@ -106,9 +96,6 @@ class Instance:
     public_mdb:       Path
     docum_mdb:        Path
     exam_description: dict
-    # ── NEW: path fragment used to identify this Access instance in the ROT
-    # Must be a substring of the .mde full path as seen by Access.CurrentProject.FullName
-    mde_path_fragment: str
 
 
 INSTANCES: list[Instance] = [
@@ -138,7 +125,6 @@ INSTANCES: list[Instance] = [
             ".docx": "Champ visuel",
             ".odt":  "Champ visuel",
         },
-        mde_path_fragment = r"Studiov2000-OM",   # unique to OM path
     ),
     Instance(
         name        = "HR",
@@ -166,7 +152,6 @@ INSTANCES: list[Instance] = [
             ".docx": "Champ visuel",
             ".odt":  "Champ visuel",
         },
-        mde_path_fragment = r"Studiov2000\Svprog",   # HR path (no -OM)
     ),
 ]
 
@@ -237,10 +222,14 @@ def set_selected_instance(name: str) -> None:
 
 
 def activate_manual_mode() -> None:
+    """
+    Switch to manual mode: both StudioVision are open,
+    user chooses which DB to send to.
+    """
     global _manual_mode
     with _state_lock:
         if _manual_mode:
-            return
+            return   # already active
         _manual_mode = True
         inst_name = _selected_instance_name
 
@@ -254,6 +243,7 @@ def activate_manual_mode() -> None:
 
 
 def deactivate_manual_mode(icon=None, item=None) -> None:
+    """Return to normal mode (only one SV / one DB)."""
     global _manual_mode
     with _state_lock:
         _manual_mode = False
@@ -274,6 +264,7 @@ def _make_icon_image(color: tuple) -> "Image.Image":
 
 
 def _set_status(text: str, processing: bool = False) -> None:
+    """Update status text and systray icon color."""
     global _status_text
     _status_text = text
     if _icon is not None:
@@ -313,6 +304,7 @@ def _quit(icon=None, item=None) -> None:
 
 
 class _InstanceMenuHandler:
+    """Handler per StudioVision instance for systray menu."""
     def __init__(self, name: str) -> None:
         self._name = name
 
@@ -330,6 +322,11 @@ _INSTANCE_HANDLERS: dict[str, _InstanceMenuHandler] = {
 
 
 def _build_menu() -> "pystray.Menu | None":
+    """
+    Build systray menu according to current state:
+    - Normal mode: submenu "Database" with radio selection
+    - Manual mode: direct OM / HR buttons + "Quit manual mode" button
+    """
     if not TRAY_AVAILABLE:
         return None
 
@@ -384,6 +381,7 @@ def _build_menu() -> "pystray.Menu | None":
 
 
 def _refresh_menu() -> None:
+    """Rebuild and apply systray menu (thread-safe)."""
     if _icon is not None:
         try:
             _icon.menu = _build_menu()
@@ -393,6 +391,11 @@ def _refresh_menu() -> None:
 
 
 def _check_signals() -> None:
+    """
+    Called every second by the background thread.
+    Detects if a 2nd shortcut was clicked (signal file in %TEMP%)
+    and activates manual mode accordingly.
+    """
     for inst_name, signal_file in _SIGNAL_FILE.items():
         if signal_file.exists():
             deleted = False
@@ -408,6 +411,7 @@ def _check_signals() -> None:
 
 
 def _launch_studiovision(inst: Instance) -> None:
+    """Launch the StudioVision associated with the given instance."""
     cmd = [inst.exe_path] + inst.launch_args
     try:
         subprocess.Popen(cmd, close_fds=True)
@@ -446,130 +450,6 @@ def db_connect(mdb_path: Path):
     return pyodbc.connect(
         f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
     )
-
-
-#  FIX 1 — ROT-based Access instance lookup
-#  Instead of GetActiveObject (which returns the first Access in ROT
-#  regardless of which one is OM or HR), we enumerate ALL running
-#  COM objects and match the one whose CurrentProject.FullName
-#  contains the instance-specific path fragment.
-
-def _get_access_app_for_instance(instance: Instance):
-    """
-    Return the win32com Access.Application object that corresponds to
-    the given Instance, by scanning the Windows Running Object Table
-    and matching CurrentProject.FullName against instance.mde_path_fragment.
-
-    Falls back to GetActiveObject if ROT enumeration fails entirely.
-    Returns None if no matching instance is found.
-    """
-    if not WIN32_AVAILABLE:
-        return None
-
-    fragment = instance.mde_path_fragment.lower()
-
-    try:
-        # pythoncom.GetRunningObjectTable() returns an IRunningObjectTable
-        rot = pythoncom.GetRunningObjectTable()
-        enum = rot.EnumRunning()
-
-        while True:
-            try:
-                moniker = enum.Next()  # raises StopIteration when done
-            except StopIteration:
-                break
-            if moniker is None:
-                break
-
-            try:
-                # Only look at "Access.Application" monikers
-                display_name = moniker.GetDisplayName(
-                    pythoncom.CreateBindCtx(0), None
-                )
-                if "access" not in display_name.lower():
-                    continue
-            except Exception:
-                continue
-
-            try:
-                obj = rot.GetObject(moniker)
-                # QI for IDispatch so win32com can wrap it
-                dispatch = obj.QueryInterface(pythoncom.IID_IDispatch)
-                app = win32com.client.Dispatch(dispatch)
-
-                project_path = ""
-                try:
-                    project_path = str(app.CurrentProject.FullName)
-                except Exception:
-                    pass
-
-                if fragment in project_path.lower():
-                    log.debug(
-                        f"[{instance.name}] ROT match: {project_path}"
-                    )
-                    return app
-
-            except Exception as e:
-                log.debug(f"ROT object probe failed: {e}")
-                continue
-
-    except Exception as e:
-        log.warning(
-            f"[{instance.name}] ROT enumeration failed ({e}), "
-            "falling back to GetActiveObject."
-        )
-
-    # ── Fallback: original behaviour (single Access open, normal mode) ──
-    try:
-        return win32com.client.GetActiveObject("Access.Application")
-    except Exception as e:
-        log.debug(f"[{instance.name}] GetActiveObject fallback failed: {e}")
-        return None
-
-#  FIX 2 — Patient existence check in target DB
-#  Before copying the image and inserting the record, verify that
-#  the patient code is present in the target PUBLIC.MDB.
-#  OM contains all HR patients too, so we must validate that the
-#  patient actually belongs to the target instance's database.
-
-def patient_exists_in_db(patient_code: str, instance: Instance) -> bool:
-    """
-    Return True if a patient folder (Photo externe) is found for this
-    code in the target PUBLIC.MDB, i.e. the patient really belongs to
-    this instance.  Uses the same query as find_patient_folder so there
-    is no extra DB round-trip — we simply run find_patient_folder and
-    treat None as "does not belong here".
-    """
-    if not PYODBC_AVAILABLE:
-        return True   # can't check → proceed (legacy behaviour)
-    if not instance.public_mdb.exists():
-        log.error(
-            f"[{instance.name}] PUBLIC.MDB not found for patient check: "
-            f"{instance.public_mdb}"
-        )
-        return False
-    try:
-        conn   = db_connect(instance.public_mdb)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM Documents "
-            "WHERE [code patient] = ? AND [Photo externe] IS NOT NULL",
-            (int(patient_code),)
-        )
-        row   = cursor.fetchone()
-        conn.close()
-        count = row[0] if row else 0
-        if count == 0:
-            log.warning(
-                f"[{instance.name}] Patient {patient_code} has no document "
-                f"in this DB → does not belong here."
-            )
-        return count > 0
-    except Exception as e:
-        log.error(
-            f"[{instance.name}] DB error during patient existence check: {e}"
-        )
-        return False
 
 
 def find_patient_folder(patient_code: str, instance: Instance) -> "Path | None":
@@ -693,68 +573,36 @@ def _read_patient_from_access(access_app) -> "dict | None":
     }
 
 
-def get_active_patient(instance: "Instance | None" = None) -> "dict | None":
-    """
-    Read the active patient from the Access instance that matches
-    `instance` (via ROT lookup).  If instance is None, falls back to
-    the original GetActiveObject behaviour (single-Access case).
-    """
+def get_active_patient() -> "dict | None":
     if not WIN32_AVAILABLE:
         return None
-
-    if instance is not None:
-        access = _get_access_app_for_instance(instance)
-    else:
-        try:
-            access = win32com.client.GetActiveObject("Access.Application")
-        except Exception as e:
-            log.debug(f"GetActiveObject failed: {e}")
-            return None
-
-    if access is None:
-        log.debug(
-            f"[{instance.name if instance else '?'}] "
-            "No matching Access instance found in ROT."
-        )
+    try:
+        access = win32com.client.GetActiveObject("Access.Application")
+    except Exception as e:
+        log.debug(f"GetActiveObject failed: {e}")
         return None
-
     patient = _read_patient_from_access(access)
     if patient:
-        inst_tag = f"[{instance.name}] " if instance else ""
         log.info(
-            f"{inst_tag}Active patient: {patient['nom']} {patient['prenom']} "
+            f"Active patient: {patient['nom']} {patient['prenom']} "
             f"(code {patient['code']})"
         )
     return patient
 
 
-def refresh_ui(
-    expected_patient_code: "str | None" = None,
-    instance: "Instance | None" = None,
-) -> None:
+def refresh_ui(expected_patient_code: "str | None" = None) -> None:
     """Refresh the active Access form (SFDoc Requery + MoveLast)."""
     if not WIN32_AVAILABLE:
         return
     try:
-        if instance is not None:
-            access = _get_access_app_for_instance(instance)
-        else:
-            access = win32com.client.GetActiveObject("Access.Application")
-
-        if access is None:
-            log.warning(
-                f"[{instance.name if instance else '?'}] "
-                "Refresh ignored: Access instance not found."
-            )
-            return
-
-        form = access.Screen.ActiveForm
+        access = win32com.client.GetActiveObject("Access.Application")
+        form   = access.Screen.ActiveForm
         if form is None:
             log.warning("Refresh ignored: no active form.")
             return
 
         if expected_patient_code is not None:
-            current      = get_active_patient(instance)
+            current      = get_active_patient()
             current_code = current["code"] if current else None
             if current_code != expected_patient_code:
                 log.warning(
@@ -887,10 +735,7 @@ def worker(file_queue: queue.Queue) -> None:
                         f"({burst_count} file(s))"
                     )
                     log.info(f"Burst complete — {msg}")
-                    refresh_ui(
-                        expected_patient_code=last_patient_code,
-                        instance=instance,
-                    )
+                    refresh_ui(expected_patient_code=last_patient_code)
                     needs_refresh     = False
                     last_patient_code = None
                     burst_count       = 0
@@ -925,13 +770,13 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            # ── Wait for active patient (using the correct Access instance) ──
+            # Wait for active patient
             patient    = None
             start_time = time.monotonic()
             first_log  = True
 
             while True:
-                patient = get_active_patient(instance)   # ← FIX 1 applied here
+                patient = get_active_patient()
                 if patient:
                     break
 
@@ -945,8 +790,8 @@ def worker(file_queue: queue.Queue) -> None:
 
                 if first_log:
                     log.info(
-                        f"[{instance.name}] No patient open in this StudioVision, "
-                        f"waiting (timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
+                        f"No patient open, waiting "
+                        f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
                     )
                     first_log = False
 
@@ -959,25 +804,6 @@ def worker(file_queue: queue.Queue) -> None:
                 f"Patient: {patient['nom']} {patient['prenom']} "
                 f"(code {patient['code']}) → DB [{instance.name}]"
             )
-
-            # ── FIX 2: verify patient belongs to target DB ──────────────────
-            if not patient_exists_in_db(patient["code"], instance):
-                log.error(
-                    f"[{instance.name}] Patient {patient['code']} "
-                    f"({patient['nom']} {patient['prenom']}) "
-                    f"does NOT belong to this database. "
-                    f"File orphaned to prevent wrong-DB insertion."
-                )
-                orphan_file(file)
-                _notify(
-                    f"Mauvaise base [{instance.name}]",
-                    f"Patient {patient['nom']} {patient['prenom']} "
-                    f"(code {patient['code']}) absent de la BDD {instance.name}.\n"
-                    f"Fichier déplacé dans Images_Oubliées.",
-                )
-                file_queue.task_done()
-                continue
-            # ────────────────────────────────────────────────────────────────
 
             patient_folder = find_patient_folder(patient["code"], instance)
             if not patient_folder:
@@ -1018,10 +844,7 @@ def worker(file_queue: queue.Queue) -> None:
             log.info(
                 f"Worker stopping — flush refresh (DB [{instance.name}])."
             )
-            refresh_ui(
-                expected_patient_code=last_patient_code,
-                instance=instance,
-            )
+            refresh_ui(expected_patient_code=last_patient_code)
             if burst_count:
                 _notify(
                     f"DB {instance.name} — Transfer complete",
@@ -1153,9 +976,8 @@ def main() -> None:
     log.info(f"  Source    : {SOURCE_DIR}")
     log.info(f"  Orphans   : {ORPHAN_DIR}")
     for i in INSTANCES:
-        log.info(f"  [{i.name}]  exe      : {i.exe_path}")
-        log.info(f"  [{i.name}]  mdb      : {i.public_mdb}")
-        log.info(f"  [{i.name}]  fragment : {i.mde_path_fragment}")
+        log.info(f"  [{i.name}]  exe  : {i.exe_path}")
+        log.info(f"  [{i.name}]  mdb  : {i.public_mdb}")
     log.info(f"  Timeout   : {PATIENT_WAIT_TIMEOUT // 60} min")
     log.info(f"  Extensions: {', '.join(sorted(WATCHED_EXTENSIONS))}")
     log.info("═" * 60)

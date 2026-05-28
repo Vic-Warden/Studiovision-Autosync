@@ -1,26 +1,42 @@
 """
-Routes incoming imaging files to the correct patient folder,
-inserts a DB record, and refreshes the Access UI.
+Routes image files to the correct patient folder, inserts a record
+into the Access database, and refreshes the interface.
 
-MULTI-INSTANCE VERSION: a single program monitors SOURCE_DIR and routes files
-to the instance (Megret or Romoli) explicitly selected by the user via the
-system tray menu. No automatic detection of the active instance is performed.
+VERSION PIERRE-HENRI (Box-6)
 
-Pipeline: PollingObserver → file_queue → Worker → Access DB + UI refresh
-          (1.5 s burst debounce, auto-reconnect on network drop)
+• Two desktop shortcuts each launch THIS program + the associated StudioVision:
+      lancer_OM.bat   →  StudioVision OM  + database \\studiovision\Studiov2000-OM
+      lancer_HR.bat   →  StudioVision HR  + database \\studiovision\Studiov2000
+
+• Only one Python process runs at a time (Windows mutex).
+
+• NORMAL MODE: only one shortcut clicked → automatic send to the chosen DB.
+
+• MANUAL MODE: both shortcuts clicked (both SV are open)
+  → notification bottom right + systray menu to choose the target DB.
+  → "↩ Quit manual mode" button to return to normal mode.
+
+• SOURCE_DIR and ORPHAN_DIR are SHARED between both instances.
+
+Usage (from the provided .bat files):
+    pythonw studiovision_monitor_multi.py --mode OM
+    pythonw studiovision_monitor_multi.py --mode HR
 
 Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
 """
 
-import os
-import pythoncom
-import queue
-import shutil
-import sys
-import threading
-import time
+import argparse
 import ctypes
 import logging
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import pythoncom
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -52,75 +68,102 @@ import winerror
 import psutil
 
 
-BOX_NAME   = "StudioVision Multi"
+BOX_NAME = "StudioVision Box-6"
 
 SOURCE_DIR = Path(r"C:\Users\Box-6\Desktop\Export CV")
 ORPHAN_DIR = Path(r"C:\Users\Box-6\Desktop\Images_Oubliées")
 
-WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt"}
+WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp",
+                           ".tif", ".tiff", ".dcm", ".pdf", ".rtf",
+                           ".doc", ".docx", ".odt"}
 FILE_LOCK_RETRY_DELAY  = 3
 FILE_LOCK_MAX_ATTEMPTS = 15
 PATIENT_POLL_INTERVAL  = 3
-PATIENT_WAIT_TIMEOUT   = 900
+PATIENT_WAIT_TIMEOUT   = 900   # seconds (15 min)
 
 ACCESS_FIELD_CODE   = "Code patient"
 ACCESS_FIELD_NOM    = "NOM"
 ACCESS_FIELD_PRENOM = "Prénom"
-
-SFDOC_SUBFORM_NAME = "SFDoc"
-
-EXAM_DESCRIPTION = {
-    ".jpg":  "Image",
-    ".jpeg": "Image",
-    ".jfif": "Image",
-    ".png":  "Image",
-    ".bmp":  "Image",
-    ".tif":  "OCT",
-    ".tiff": "OCT",
-    ".dcm":  "DICOM",
-    ".pdf":  "Document",
-    ".rtf":  "Document",
-    ".doc":  "Document",
-    ".docx": "Document",
-    ".odt":  "Document",
-}
+SFDOC_SUBFORM_NAME  = "SFDoc"
 
 
 @dataclass
 class Instance:
-    name:        str
-    exe:         str
-    dest_photos: Path
-    public_mdb:  Path
-    docum_mdb:   Path
+    name:             str
+    exe_path:         str
+    launch_args:      list
+    dest_photos:      Path
+    public_mdb:       Path
+    docum_mdb:        Path
+    exam_description: dict
 
 
 INSTANCES: list[Instance] = [
     Instance(
-        name        = "Romoli",
-        exe         = "msaccess.exe",
-        dest_photos = Path(r"\\studiovision\Studiov2000\PHOTOS"),
-        public_mdb  = Path(r"\\studiovision\Studiov2000\fichier\PUBLIC.MDB"),
-        docum_mdb   = Path(r"\\studiovision\Studiov2000\fichier\DOCUM.MDB"),
-    ),
-    Instance(
-        name        = "Megret",
-        exe         = "msaccess.exe",
+        name        = "OM",
+        exe_path    = r"C:\Studiov2000-OM\svprog\msaccess.exe",
+        launch_args = [
+            "/runtime", r"C:\Studiov2000-OM\svprog\Ophprog.mde",
+            "/wrkgrp",  r"C:\Studiov2000-OM\config\system.mdw",
+            "/User", "/Pwd", "/X", "demarrage",
+        ],
         dest_photos = Path(r"\\studiovision\Studiov2000-OM\PHOTOS"),
         public_mdb  = Path(r"\\studiovision\Studiov2000-OM\fichier\PUBLIC.MDB"),
         docum_mdb   = Path(r"\\studiovision\Studiov2000-OM\fichier\DOCUM.MDB"),
+        exam_description = {
+            ".jpg":  "Champ visuel",
+            ".jpeg": "Champ visuel",
+            ".jfif": "Champ visuel",
+            ".png":  "Champ visuel",
+            ".bmp":  "Champ visuel",
+            ".tif":  "OCT",
+            ".tiff": "OCT",
+            ".dcm":  "DICOM",
+            ".pdf":  "Document",
+            ".rtf":  "Document",
+            ".doc":  "Document",
+            ".docx": "Document",
+            ".odt":  "Document",
+        },
+    ),
+    Instance(
+        name        = "HR",
+        exe_path    = r"C:\Studiov2000\Svprog\MSACCESS.EXE",
+        launch_args = [
+            "/runtime", r"C:\Studiov2000\svprog\Ophprog.mde",
+            "/wrkgrp",  r"C:\Studiov2000\config\system.mdw",
+            "/User", "/Pwd", "/X", "demarrage",
+        ],
+        dest_photos = Path(r"\\studiovision\Studiov2000\PHOTOS"),
+        public_mdb  = Path(r"\\studiovision\Studiov2000\fichier\PUBLIC.MDB"),
+        docum_mdb   = Path(r"\\studiovision\Studiov2000\fichier\DOCUM.MDB"),
+        exam_description = {
+            ".jpg":  "Image",
+            ".jpeg": "Image",
+            ".jfif": "Image",
+            ".png":  "Image",
+            ".bmp":  "Image",
+            ".tif":  "OCT",
+            ".tiff": "OCT",
+            ".dcm":  "DICOM",
+            ".pdf":  "Document",
+            ".rtf":  "Document",
+            ".doc":  "Document",
+            ".docx": "Document",
+            ".odt":  "Document",
+        },
     ),
 ]
 
-# Build a quick lookup by name for the menu handlers.
 INSTANCES_BY_NAME: dict[str, Instance] = {inst.name: inst for inst in INSTANCES}
 
-# Default instance selected at startup (Megret).
-_DEFAULT_INSTANCE_NAME = "Megret"
+_SIGNAL_DIR  = Path(tempfile.gettempdir())
+_SIGNAL_FILE = {
+    inst.name: _SIGNAL_DIR / f"sv_signal_{inst.name}.tmp"
+    for inst in INSTANCES
+}
 
-# Used for the double-click guard: block launch if any known SV process is running.
-_ALL_SV_EXES = {inst.exe.lower() for inst in INSTANCES}
-
+_MUTEX_NAME = "ImageRouter_StudioVision_PierreHenri_Box6_Mutex"
 
 _LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -137,64 +180,106 @@ logging.basicConfig(
 )
 log = logging.getLogger("image_router")
 
+
 _NETWORK_SHARE_POLL = 10
 
-_ICON_SIZE    = 64
 _COLOR_READY  = (30, 144, 255)
 _COLOR_ACTIVE = (50, 205, 50)
+_COLOR_MANUAL = (255, 140, 0)
+_ICON_SIZE    = 64
 
-_icon: "pystray.Icon | None" = None
-_status_text: str             = "Starting..."
-_stop_event: threading.Event  = threading.Event()
-_mutex_handle                 = None
+_icon:         "pystray.Icon | None" = None
+_status_text:  str                   = "Démarrage..."
+_stop_event:   threading.Event       = threading.Event()
+_mutex_handle                        = None
 
-# ── Selected instance (protected by _instance_lock) ──────────────────────────
-_selected_instance_name: str      = _DEFAULT_INSTANCE_NAME
-_instance_lock:          threading.Lock = threading.Lock()
+_state_lock:             threading.Lock = threading.Lock()
+_selected_instance_name: str           = INSTANCES[0].name
+_manual_mode:            bool          = False
 
 
 def get_selected_instance() -> Instance:
-    """Return the Instance currently selected in the tray menu (thread-safe)."""
-    with _instance_lock:
+    """Thread-safe getter for the currently selected instance."""
+    with _state_lock:
         return INSTANCES_BY_NAME[_selected_instance_name]
 
 
+def _is_manual_mode() -> bool:
+    with _state_lock:
+        return _manual_mode
+
+
 def set_selected_instance(name: str) -> None:
-    """Switch the active instance and update tray status (thread-safe)."""
+    """Change the target DB and update status (thread-safe)."""
     global _selected_instance_name
-    with _instance_lock:
+    with _state_lock:
         _selected_instance_name = name
-    log.info(f"BDD sélectionnée : [{name}]")
-    _set_status(f"{BOX_NAME} — BDD : {name}", processing=False)
-    if _icon is not None:
-        try:
-            _icon.update_menu()
-        except Exception as e:
-            log.debug(f"Menu update failed: {e}")
+        manual = _manual_mode
+    log.info(f"Selected DB: [{name}]")
+    prefix = "⚡ MODE MANUEL" if manual else BOX_NAME
+    _set_status(f"{prefix} — BDD : {name}")
+    _refresh_menu()
 
 
-# ── Tray helpers ──────────────────────────────────────────────────────────────
+def activate_manual_mode() -> None:
+    """
+    Switch to manual mode: both StudioVision are open,
+    user chooses which DB to send to.
+    """
+    global _manual_mode
+    with _state_lock:
+        if _manual_mode:
+            return   # already active
+        _manual_mode = True
+        inst_name = _selected_instance_name
 
-def _make_icon(color: tuple) -> "Image.Image":
+    log.info("Manual mode activated (both StudioVision detected).")
+    _set_status(f"⚡ MODE MANUEL — BDD : {inst_name}")
+    _notify(
+        "⚡ Mode Manuel Activé",
+        "Both StudioVision are open.\nClick the blue icon bottom right to choose the database.",
+    )
+    _refresh_menu()
+
+
+def deactivate_manual_mode(icon=None, item=None) -> None:
+    """Return to normal mode (only one SV / one DB)."""
+    global _manual_mode
+    with _state_lock:
+        _manual_mode = False
+        inst_name = _selected_instance_name
+
+    log.info(f"Manual mode deactivated. Active DB: {inst_name}")
+    _set_status(f"{BOX_NAME} — BDD : {inst_name} — Prêt")
+    _notify("Mode Normal", f"Active database: {inst_name}")
+    _refresh_menu()
+
+
+def _make_icon_image(color: tuple) -> "Image.Image":
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    margin = 4
-    draw.ellipse(
-        [margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin],
-        fill=color,
-    )
+    m    = 4
+    draw.ellipse([m, m, _ICON_SIZE - m, _ICON_SIZE - m], fill=color)
     return img
 
 
 def _set_status(text: str, processing: bool = False) -> None:
+    """Update status text and systray icon color."""
     global _status_text
     _status_text = text
     if _icon is not None:
         try:
-            _icon.icon = _make_icon(_COLOR_ACTIVE if processing else _COLOR_READY)
+            manual = _is_manual_mode()
+            if manual:
+                color = _COLOR_MANUAL
+            elif processing:
+                color = _COLOR_ACTIVE
+            else:
+                color = _COLOR_READY
+            _icon.icon = _make_icon_image(color)
             _icon.update_menu()
         except Exception as e:
-            log.debug(f"Tray update failed: {e}")
+            log.debug(f"Icon update failed: {e}")
 
 
 def _notify(title: str, message: str = "") -> None:
@@ -205,58 +290,146 @@ def _notify(title: str, message: str = "") -> None:
             log.debug(f"Notification failed: {e}")
 
 
-def _open_logs(icon, item) -> None:   # noqa: ARG001
+def _open_logs(icon=None, item=None) -> None:
     try:
         os.startfile(str(_LOG_FILE))
     except Exception as e:
-        log.warning(f"Could not open log file: {e}")
+        log.warning(f"Could not open logs: {e}")
 
 
-def _quit(icon, item) -> None:        # noqa: ARG001
-    log.info("Quit requested from tray menu.")
+def _quit(icon=None, item=None) -> None:
+    log.info("Exit requested from systray menu.")
     _stop_event.set()
-    icon.stop()
+    if _icon is not None:
+        _icon.stop()
 
-
-# ── Instance selector menu items ──────────────────────────────────────────────
-#
-# pystray _assert_action rejects closures/lambdas on older versions.
-# Bound methods of a class pass the check unconditionally.
 
 class _InstanceMenuHandler:
-    """One handler per StudioVision instance; bound methods used as callbacks."""
+    """Handler per StudioVision instance for systray menu."""
     def __init__(self, name: str) -> None:
         self._name = name
 
-    def action(self, icon, item) -> None:   # noqa: ARG002
+    def action(self, icon=None, item=None) -> None:
         set_selected_instance(self._name)
 
-    def checked(self, item) -> bool:        # noqa: ARG002
-        with _instance_lock:
+    def checked(self, item=None) -> bool:
+        with _state_lock:
             return _selected_instance_name == self._name
 
 
-# Pre-build handlers so they stay alive for the lifetime of the process.
-_INSTANCE_HANDLERS: dict[str, "_InstanceMenuHandler"] = {
+_INSTANCE_HANDLERS: dict[str, _InstanceMenuHandler] = {
     inst.name: _InstanceMenuHandler(inst.name) for inst in INSTANCES
 }
 
 
-def _make_instance_menu() -> "pystray.Menu":
-    """Radio-style sub-menu — one entry per instance, bound methods only."""
-    items = [
-        pystray.MenuItem(
-            text=f"Base : {inst.name}",
-            action=_INSTANCE_HANDLERS[inst.name].action,
-            checked=_INSTANCE_HANDLERS[inst.name].checked,
-            radio=True,
+def _build_menu() -> "pystray.Menu | None":
+    """
+    Build systray menu according to current state:
+    - Normal mode: submenu "Database" with radio selection
+    - Manual mode: direct OM / HR buttons + "Quit manual mode" button
+    """
+    if not TRAY_AVAILABLE:
+        return None
+
+    status_item = pystray.MenuItem(
+        lambda item: _status_text, action=None, enabled=False,
+    )
+    sep   = pystray.Menu.SEPARATOR
+    logs  = pystray.MenuItem("📋 Ouvrir les logs", _open_logs)
+    quit_ = pystray.MenuItem("✖ Quitter le programme", _quit)
+
+    with _state_lock:
+        manual = _manual_mode
+
+    if manual:
+        instance_items = [
+            pystray.MenuItem(
+                f"📤  Envoyer vers {inst.name}",
+                action=_INSTANCE_HANDLERS[inst.name].action,
+                checked=_INSTANCE_HANDLERS[inst.name].checked,
+                radio=True,
+            )
+            for inst in INSTANCES
+        ]
+        return pystray.Menu(
+            status_item,
+            sep,
+            *instance_items,
+            sep,
+            pystray.MenuItem("↩  Quitter mode manuel", deactivate_manual_mode),
+            sep,
+            logs,
+            quit_,
         )
-        for inst in INSTANCES
-    ]
-    return pystray.Menu(*items)
+    else:
+        submenu_items = [
+            pystray.MenuItem(
+                f"Base : {inst.name}",
+                action=_INSTANCE_HANDLERS[inst.name].action,
+                checked=_INSTANCE_HANDLERS[inst.name].checked,
+                radio=True,
+            )
+            for inst in INSTANCES
+        ]
+        return pystray.Menu(
+            status_item,
+            sep,
+            pystray.MenuItem("🗄  Base de données", pystray.Menu(*submenu_items)),
+            sep,
+            logs,
+            quit_,
+        )
 
 
-# ── Network / DB helpers ──────────────────────────────────────────────────────
+def _refresh_menu() -> None:
+    """Rebuild and apply systray menu (thread-safe)."""
+    if _icon is not None:
+        try:
+            _icon.menu = _build_menu()
+            _icon.update_menu()
+        except Exception as e:
+            log.debug(f"Menu rebuild failed: {e}")
+
+
+def _check_signals() -> None:
+    """
+    Called every second by the background thread.
+    Detects if a 2nd shortcut was clicked (signal file in %TEMP%)
+    and activates manual mode accordingly.
+    """
+    for inst_name, signal_file in _SIGNAL_FILE.items():
+        if signal_file.exists():
+            deleted = False
+            try:
+                signal_file.unlink()
+                deleted = True
+            except Exception as e:
+                log.warning(f"Could not delete signal file {signal_file}: {e}")
+
+            if deleted:
+                log.info(f"Signal received: shortcut {inst_name} clicked while program already running.")
+                activate_manual_mode()
+
+
+def _launch_studiovision(inst: Instance) -> None:
+    """Launch the StudioVision associated with the given instance."""
+    cmd = [inst.exe_path] + inst.launch_args
+    try:
+        subprocess.Popen(cmd, close_fds=True)
+        log.info(f"[{inst.name}] StudioVision launched: {inst.exe_path}")
+    except FileNotFoundError:
+        log.error(f"[{inst.name}] Executable not found: {inst.exe_path}")
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            f"StudioVision {inst.name} not found:\n\n"
+            f"{inst.exe_path}\n\n"
+            "Check the path in the script (exe_path variable).",
+            f"Error — StudioVision {inst.name}",
+            0x10,
+        )
+    except Exception as e:
+        log.error(f"[{inst.name}] Could not launch StudioVision: {e}")
+
 
 def wait_for_network_share() -> None:
     is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
@@ -266,12 +439,12 @@ def wait_for_network_share() -> None:
     while not SOURCE_DIR.is_dir():
         attempt += 1
         log.warning(
-            f"Network share not reachable: {SOURCE_DIR}  "
-            f"(attempt {attempt}, retrying in {_NETWORK_SHARE_POLL}s)"
+            f"Network share inaccessible: {SOURCE_DIR}  "
+            f"(attempt {attempt}, retry in {_NETWORK_SHARE_POLL}s)"
         )
         time.sleep(_NETWORK_SHARE_POLL)
     if attempt:
-        log.info(f"Network share is now accessible after {attempt} attempt(s): {SOURCE_DIR}")
+        log.info(f"Network share accessible after {attempt} attempt(s): {SOURCE_DIR}")
 
 
 def db_connect(mdb_path: Path):
@@ -299,10 +472,9 @@ def find_patient_folder(patient_code: str, instance: Instance) -> "Path | None":
         conn.close()
 
         if not row or not row[0]:
-            log.warning(f"[{instance.name}] No existing document found for patient {patient_code}.")
+            log.warning(f"[{instance.name}] No existing document for patient {patient_code}.")
             return None
 
-        # Derive the patient folder from an existing document path stored in the DB.
         parts = row[0].strip().strip("\\").split("\\")
         if len(parts) < 2:
             log.error(f"[{instance.name}] Unexpected 'Photo externe' format: {row[0]}")
@@ -310,22 +482,24 @@ def find_patient_folder(patient_code: str, instance: Instance) -> "Path | None":
 
         folder = instance.dest_photos / parts[0] / parts[1]
         if not folder.is_dir():
-            log.error(f"[{instance.name}] Resolved folder not found on disk: {folder}")
+            log.error(f"[{instance.name}] Patient folder not found: {folder}")
             return None
 
         log.info(f"[{instance.name}] Patient folder resolved: {folder}")
         return folder
     except Exception as e:
-        log.error(f"[{instance.name}] DB folder lookup failed: {e}")
+        log.error(f"[{instance.name}] DB error (find_patient_folder): {e}")
         return None
 
 
-def insert_document(patient: dict, relative_path: str, description: str, instance: Instance) -> bool:
+def insert_document(
+    patient: dict, relative_path: str, description: str, instance: Instance
+) -> bool:
     if not PYODBC_AVAILABLE:
-        log.warning("pyodbc not available, insert skipped.")
+        log.warning("pyodbc not available, insert ignored.")
         return False
     if not instance.public_mdb.exists():
-        log.error(f"[{instance.name}] PUBLIC.MDB not found, insert skipped.")
+        log.error(f"[{instance.name}] PUBLIC.MDB not found, insert ignored.")
         return False
     try:
         conn   = db_connect(instance.public_mdb)
@@ -333,16 +507,18 @@ def insert_document(patient: dict, relative_path: str, description: str, instanc
         cursor.execute(
             """
             INSERT INTO Documents
-                ([code patient], [Date], DESCRIPTIONS, TEXTE, [Photo externe], TypeVW, NumDocExterne)
+                ([code patient], [Date], DESCRIPTIONS, TEXTE,
+                 [Photo externe], TypeVW, NumDocExterne)
             VALUES (?, ?, ?, ?, ?, 99, NULL)
             """,
-            (int(patient["code"]), datetime.now(), description, relative_path, relative_path)
+            (int(patient["code"]), datetime.now(), description,
+             relative_path, relative_path)
         )
         conn.commit()
         conn.close()
         log.info(
             f"[{instance.name}] Insert OK: patient={patient['code']} "
-            f"path='{relative_path}' db={instance.public_mdb.name}"
+            f"path='{relative_path}'"
         )
         return True
     except Exception as e:
@@ -350,7 +526,6 @@ def insert_document(patient: dict, relative_path: str, description: str, instanc
         return False
 
 
-# ControlType constant for Access subform controls.
 _AC_SUBFORM = 112
 
 
@@ -371,7 +546,6 @@ def _find_sfdoc(form):
 
 
 def _read_patient_from_access(access_app) -> "dict | None":
-    """Extract patient fields from the active form of a given Access COM object."""
     try:
         form = access_app.Screen.ActiveForm
     except Exception:
@@ -401,20 +575,13 @@ def _read_patient_from_access(access_app) -> "dict | None":
 
 
 def get_active_patient() -> "dict | None":
-    """
-    Read the patient currently open in any running Access window.
-    Returns only the patient record (code, nom, prénom).
-    Instance routing is handled separately via the tray menu selection.
-    """
     if not WIN32_AVAILABLE:
         return None
-
     try:
         access = win32com.client.GetActiveObject("Access.Application")
     except Exception as e:
         log.debug(f"GetActiveObject failed: {e}")
         return None
-
     patient = _read_patient_from_access(access)
     if patient:
         log.info(
@@ -425,53 +592,51 @@ def get_active_patient() -> "dict | None":
 
 
 def refresh_ui(expected_patient_code: "str | None" = None) -> None:
-    """Refresh the active Access form: SFDoc Requery + MoveLast."""
+    """Refresh the active Access form (SFDoc Requery + MoveLast)."""
     if not WIN32_AVAILABLE:
         return
     try:
         access = win32com.client.GetActiveObject("Access.Application")
         form   = access.Screen.ActiveForm
         if form is None:
-            log.warning("Refresh skipped: no active form in Access.")
+            log.warning("Refresh ignored: no active form.")
             return
 
-        # Guard against a patient change occurring between file processing and refresh.
         if expected_patient_code is not None:
             current      = get_active_patient()
             current_code = current["code"] if current else None
             if current_code != expected_patient_code:
                 log.warning(
-                    f"Refresh skipped: active patient changed "
+                    f"Refresh ignored: patient changed "
                     f"(expected={expected_patient_code}, current={current_code})."
                 )
                 return
 
         try:
             form.Refresh()
-            log.info(f"Refresh() on parent form '{form.Name}'")
+            log.info(f"Refresh() on form '{form.Name}'")
         except Exception as e_ref:
-            log.warning(f"Refresh() on parent form failed ({e_ref}), continuing...")
+            log.warning(f"Refresh() failed ({e_ref}), continuing...")
 
         sfdoc = _find_sfdoc(form)
         if sfdoc is None:
             log.warning(
-                f"Subform '{SFDOC_SUBFORM_NAME}' not found in the active form. "
-                "SFDoc refresh skipped."
+                f"Subform '{SFDOC_SUBFORM_NAME}' not found. "
+                "SFDoc refresh ignored."
             )
             return
 
-        # Clear Dirty state to avoid Access blocking the Requery call.
         try:
             if form.Dirty:
-                log.info("Parent form is in edit mode (Dirty=True); clearing Dirty before Requery.")
+                log.info("Form in edit mode (Dirty=True); clearing before Requery.")
                 form.Dirty = False
         except Exception as e_dirty:
-            log.debug(f"Dirty check/clear failed ({e_dirty}), continuing...")
+            log.debug(f"Dirty check/clear failed: {e_dirty}")
 
         _REQUERY_ATTEMPTS = 3
         _REQUERY_DELAY    = 0.5
+        requery_ok        = False
 
-        requery_ok = False
         for attempt in range(1, _REQUERY_ATTEMPTS + 1):
             try:
                 sfdoc.Requery()
@@ -480,34 +645,27 @@ def refresh_ui(expected_patient_code: "str | None" = None) -> None:
                 break
             except Exception as e_req:
                 log.warning(
-                    f"Requery() attempt {attempt}/{_REQUERY_ATTEMPTS} failed "
-                    f"on '{SFDOC_SUBFORM_NAME}': {e_req}"
+                    f"Requery() attempt {attempt}/{_REQUERY_ATTEMPTS} failed: {e_req}"
                 )
                 if attempt < _REQUERY_ATTEMPTS:
                     time.sleep(_REQUERY_DELAY)
 
         if not requery_ok:
-            log.warning(
-                f"All {_REQUERY_ATTEMPTS} Requery() attempts failed on "
-                f"'{SFDOC_SUBFORM_NAME}'; falling back to Refresh()."
-            )
             try:
                 sfdoc.Refresh()
                 log.info(f"Fallback Refresh() on '{SFDOC_SUBFORM_NAME}'")
             except Exception as e_ref2:
-                log.warning(f"Fallback Refresh() also failed on '{SFDOC_SUBFORM_NAME}': {e_ref2}")
+                log.warning(f"Fallback Refresh() failed: {e_ref2}")
 
         try:
             sfdoc.Recordset.MoveLast()
             log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}'")
         except Exception as e_ml:
-            log.debug(f"MoveLast() failed on '{SFDOC_SUBFORM_NAME}': {e_ml}")
+            log.debug(f"MoveLast() failed: {e_ml}")
 
     except Exception as e:
         log.warning(f"COM refresh failed (non-blocking): {e}")
 
-
-# ── File helpers ──────────────────────────────────────────────────────────────
 
 def wait_for_file(file: Path) -> bool:
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
@@ -515,9 +673,11 @@ def wait_for_file(file: Path) -> bool:
             with file.open("rb"):
                 return True
         except (PermissionError, OSError):
-            log.debug(f"File locked ({attempt}/{FILE_LOCK_MAX_ATTEMPTS}), retrying...")
+            log.debug(f"File locked ({attempt}/{FILE_LOCK_MAX_ATTEMPTS}), retry...")
             time.sleep(FILE_LOCK_RETRY_DELAY)
-    log.error(f"File still locked after {FILE_LOCK_MAX_ATTEMPTS} attempts: {file}")
+    log.error(
+        f"File still locked after {FILE_LOCK_MAX_ATTEMPTS} attempts: {file}"
+    )
     return False
 
 
@@ -525,14 +685,13 @@ def move_file(source: Path, dest_folder: Path, label: str = "") -> "Path | None"
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
     if dest.exists():
-        # Append a timestamp to avoid silently overwriting an existing file.
         ts   = int(time.time())
         dest = dest_folder / f"{source.stem}_{ts}{source.suffix}"
         log.info(f"Name conflict, renamed to {dest.name}")
     try:
         shutil.move(str(source), str(dest))
         tag = f"[{label}]  " if label else ""
-        log.info(f"{tag}{source.name} -> {dest}")
+        log.info(f"{tag}{source.name} → {dest}")
         return dest
     except Exception as e:
         log.error(f"Move failed: {e}")
@@ -540,11 +699,9 @@ def move_file(source: Path, dest_folder: Path, label: str = "") -> "Path | None"
 
 
 def orphan_file(file: Path) -> None:
-    log.warning(f"Orphaning: {file.name}")
+    log.warning(f"Orphan file: {file.name}")
     move_file(file, ORPHAN_DIR, label="ORPHAN")
 
-
-# ── Worker ────────────────────────────────────────────────────────────────────
 
 def prevent_sleep() -> None:
     try:
@@ -552,38 +709,40 @@ def prevent_sleep() -> None:
             0x80000000 |  # ES_CONTINUOUS
             0x00000001    # ES_SYSTEM_REQUIRED
         )
-        log.info("Sleep prevention active.")
+        log.info("Sleep prevention enabled.")
     except Exception as e:
-        log.warning(f"Could not set execution state: {e}")
+        log.warning(f"SetThreadExecutionState failed: {e}")
 
 
 def worker(file_queue: queue.Queue) -> None:
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    needs_refresh: bool           = False
-    last_patient_code: str | None = None
-    burst_count: int              = 0
+    needs_refresh:     bool      = False
+    last_patient_code: str|None  = None
+    burst_count:       int       = 0
 
     try:
         while True:
-            # Block for up to 1.5 s to collect burst; flush UI refresh when idle.
+            # Burst debounce wait 1.5s
             try:
                 file: Path = file_queue.get(timeout=1.5)
             except queue.Empty:
+                # End of burst: flush UI refresh
                 if needs_refresh:
                     instance = get_selected_instance()
                     msg = (
-                        f"Envoi dans la BDD de {instance.name} "
-                        f"({burst_count} fichier(s))"
+                        f"Send to DB {instance.name} "
+                        f"({burst_count} file(s))"
                     )
-                    log.info(f"Burst complet — {msg}")
+                    log.info(f"Burst complete — {msg}")
                     refresh_ui(expected_patient_code=last_patient_code)
-                    needs_refresh = False
+                    needs_refresh     = False
                     last_patient_code = None
-                    _notify(f"BDD {instance.name} — Transfert terminé", msg)
-                    _set_status(f"{BOX_NAME} — BDD : {instance.name} — Prêt", processing=False)
-                    burst_count = 0
+                    burst_count       = 0
+                    _notify(f"DB {instance.name} — Transfer complete", msg)
+                    prefix = "⚡ MODE MANUEL" if _is_manual_mode() else BOX_NAME
+                    _set_status(f"{prefix} — BDD : {instance.name} — Prêt")
                 continue
             except Exception as e:
                 log.error(f"Queue error: {e}")
@@ -592,31 +751,27 @@ def worker(file_queue: queue.Queue) -> None:
             instance = get_selected_instance()
             log.info(
                 f"Processing: {file.name} ({file_queue.qsize()} pending) "
-                f"→ BDD [{instance.name}]"
+                f"→ DB [{instance.name}]"
             )
 
             if burst_count == 0 and not needs_refresh:
-                _notify(
-                    f"BDD {instance.name} — Transfert en cours",
-                    file.name,
-                )
+                _notify(f"DB {instance.name} — Transfer in progress", file.name)
             _set_status(
-                f"Envoi dans la BDD de {instance.name}...",
-                processing=True,
+                f"Sending to DB {instance.name}...", processing=True
             )
 
             if not file.exists():
-                log.warning(f"File gone before processing: {file}")
+                log.warning(f"File disappeared before processing: {file}")
                 file_queue.task_done()
                 continue
 
             if not wait_for_file(file):
-                log.error(f"Aborting, persistent lock: {file.name}")
-                _notify("Erreur", f"Fichier verrouillé : {file.name}")
+                log.error(f"Abandon — persistent lock: {file.name}")
+                _notify("Error", f"File locked: {file.name}")
                 file_queue.task_done()
                 continue
 
-            # ── Read the patient code from the active Access window ────────
+            # Wait for active patient
             patient    = None
             start_time = time.monotonic()
             first_log  = True
@@ -629,15 +784,15 @@ def worker(file_queue: queue.Queue) -> None:
                 elapsed = time.monotonic() - start_time
                 if elapsed >= PATIENT_WAIT_TIMEOUT:
                     orphan_file(file)
-                    _notify("Fichier orphelin", file.name)
+                    _notify("Orphan file", file.name)
                     file_queue.task_done()
                     patient = None
                     break
 
                 if first_log:
                     log.info(
-                        f"Aucun patient ouvert, en attente "
-                        f"(timeout dans {PATIENT_WAIT_TIMEOUT // 60} min)"
+                        f"No patient open, waiting "
+                        f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
                     )
                     first_log = False
 
@@ -647,21 +802,18 @@ def worker(file_queue: queue.Queue) -> None:
                 continue
 
             log.info(
-                f"Patient : {patient['nom']} {patient['prenom']} "
-                f"(code {patient['code']}) → BDD [{instance.name}]"
+                f"Patient: {patient['nom']} {patient['prenom']} "
+                f"(code {patient['code']}) → DB [{instance.name}]"
             )
-
-            # ── Route to the explicitly selected instance ──────────────────
-            # (no automatic detection — the user's tray choice is the only source of truth)
 
             patient_folder = find_patient_folder(patient["code"], instance)
             if not patient_folder:
                 log.error(
-                    f"[{instance.name}] Could not resolve folder for patient {patient['code']}. "
-                    "Orphaning."
+                    f"[{instance.name}] Patient folder not found for "
+                    f"{patient['code']}. Orphaned."
                 )
                 orphan_file(file)
-                _notify("Fichier orphelin", file.name)
+                _notify("Orphan file", file.name)
                 file_queue.task_done()
                 continue
 
@@ -672,19 +824,18 @@ def worker(file_queue: queue.Queue) -> None:
 
             group_name    = patient_folder.parent.name
             relative_path = f"\\{group_name}\\{patient_folder.name}\\{dest.name}"
-            description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
+            description   = instance.exam_description.get(file.suffix.lower(), "Image")
 
             if insert_document(patient, relative_path, description, instance):
                 needs_refresh     = True
                 last_patient_code = patient["code"]
                 burst_count      += 1
                 log.debug(
-                    f"Insert OK dans [{instance.name}] — "
-                    "needs_refresh=True (refresh différé à la fin du burst)."
+                    f"Insert OK in [{instance.name}] — deferred refresh."
                 )
             else:
-                log.warning("Insert échoué, refresh flag inchangé.")
-                _notify("Erreur BDD", "Insertion échouée — consultez les logs")
+                log.warning("Insert failed.")
+                _notify("DB Error", "Insert failed — check logs")
 
             file_queue.task_done()
 
@@ -692,23 +843,22 @@ def worker(file_queue: queue.Queue) -> None:
         if needs_refresh:
             instance = get_selected_instance()
             log.info(
-                f"Worker s'arrête — flush du refresh UI en attente "
-                f"(BDD [{instance.name}])."
+                f"Worker stopping — flush refresh (DB [{instance.name}])."
             )
             refresh_ui(expected_patient_code=last_patient_code)
             if burst_count:
-                msg = f"Envoi dans la BDD de {instance.name} ({burst_count} fichier(s))"
-                _notify(f"BDD {instance.name} — Transfert terminé", msg)
-        _set_status(f"{BOX_NAME} — Arrêté")
+                _notify(
+                    f"DB {instance.name} — Transfer complete",
+                    f"Send to DB {instance.name} ({burst_count} file(s))",
+                )
+        _set_status(f"{BOX_NAME} — Stopped")
         pythoncom.CoUninitialize()
 
 
-# ── File watcher ──────────────────────────────────────────────────────────────
-
 class ImageProducer(FileSystemEventHandler):
-    def __init__(self, file_queue: queue.Queue) -> None:
+    def __init__(self, fq: queue.Queue) -> None:
         super().__init__()
-        self._queue = file_queue
+        self._queue = fq
 
     def on_created(self, event) -> None:
         if event.is_directory:
@@ -716,7 +866,7 @@ class ImageProducer(FileSystemEventHandler):
         file = Path(event.src_path)
         if file.suffix.lower() not in WATCHED_EXTENSIONS:
             return
-        log.info(f"Enqueued: {file.name} (queue size: {self._queue.qsize() + 1})")
+        log.info(f"Enqueued : {file.name} (queue : {self._queue.qsize() + 1})")
         self._queue.put(file)
 
 
@@ -727,29 +877,33 @@ def _run_background(file_queue: queue.Queue) -> None:
         obs = Observer()
         obs.schedule(ImageProducer(file_queue), str(SOURCE_DIR), recursive=True)
         obs.start()
-        log.info("Observer started — watching for images.")
+        log.info("Observer started — monitoring source folder.")
         return obs
 
     observer = _start_observer()
-    inst = get_selected_instance()
-    _set_status(f"{BOX_NAME} — BDD : {inst.name} — Prêt", processing=False)
+    inst     = get_selected_instance()
+    _set_status(f"{BOX_NAME} — BDD : {inst.name} — Prêt")
 
     try:
         while not _stop_event.is_set():
+            _check_signals()
             if not observer.is_alive():
-                log.warning("Observer has stopped (network drop?). Attempting reconnect...")
-                _set_status(f"{BOX_NAME} — Reconnexion...", processing=False)
+                log.warning("Observer stopped (network loss?). Reconnecting...")
+                _set_status(f"{BOX_NAME} — Reconnecting...")
                 try:
                     observer.stop()
                     observer.join(timeout=5)
                 except Exception:
                     pass
                 wait_for_network_share()
-                log.info(f"Waiting {_RECONNECT_WAIT}s before restarting observer...")
+                log.info(
+                    f"Waiting {_RECONNECT_WAIT}s before restarting observer..."
+                )
                 time.sleep(_RECONNECT_WAIT)
                 observer = _start_observer()
-                inst = get_selected_instance()
-                _set_status(f"{BOX_NAME} — BDD : {inst.name} — Prêt", processing=False)
+                inst     = get_selected_instance()
+                if not _is_manual_mode():
+                    _set_status(f"{BOX_NAME} — BDD : {inst.name} — Prêt")
             time.sleep(1)
     finally:
         observer.stop()
@@ -763,103 +917,102 @@ def _run_background(file_queue: queue.Queue) -> None:
             _icon.stop()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 def main() -> None:
-    global _icon, _mutex_handle
+    global _icon, _mutex_handle, _selected_instance_name
 
-    # Ensure only one instance of this router runs at a time.
-    _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_Multi_Mutex")
-    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+    parser = argparse.ArgumentParser(
+        description=f"{BOX_NAME} — Image router"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=[inst.name for inst in INSTANCES],
+        default=INSTANCES[0].name,
+        help="StudioVision instance to target at startup (OM or HR)",
+    )
+    args = parser.parse_args()
+    mode = args.mode
+
+    _mutex_handle = win32event.CreateMutex(None, False, _MUTEX_NAME)
+    already_running = (win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS)
+
+    if already_running:
+        log.info(
+            f"Program already running. "
+            f"Sending signal [{mode}] and launching StudioVision {mode}."
+        )
+        try:
+            _SIGNAL_FILE[mode].touch()
+            log.info(f"Signal file created: {_SIGNAL_FILE[mode]}")
+        except Exception as e:
+            log.error(f"Could not create signal file: {e}")
+
+        _launch_studiovision(INSTANCES_BY_NAME[mode])
         sys.exit(0)
 
-    # When launched by double-click from Explorer, refuse to start if SV is already running
-    # to prevent conflicts with file handles and COM objects.
-    try:
-        parent_name = psutil.Process(os.getpid()).parent().name().lower()
-    except Exception:
-        parent_name = ""
-
-    if parent_name == "explorer.exe":
-        sv_running = any(
-            (p.info["name"] or "").lower() in _ALL_SV_EXES
-            for p in psutil.process_iter(["name"])
-        )
-        if sv_running:
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "Pour relancer le routeur d'images, veuillez fermer complètement "
-                "tous les StudioVision puis relancer.",
-                "Routeur d'images",
-                0x30,
-            )
-            sys.exit(0)
+    _selected_instance_name = mode
+    inst                    = INSTANCES_BY_NAME[mode]
 
     prevent_sleep()
 
     if not SOURCE_DIR.exists():
         log.critical(f"Source folder not found: {SOURCE_DIR}")
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            f"Source folder not found:\n{SOURCE_DIR}",
+            "Error — Image router",
+            0x10,
+        )
         sys.exit(1)
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("MULTI-INSTANCE version started (sélection manuelle de la BDD)")
-    log.info(f"  Source      : {SOURCE_DIR}")
-    log.info(f"  Orphelins   : {ORPHAN_DIR}")
-    log.info(f"  BDD défaut  : {_DEFAULT_INSTANCE_NAME}")
-    for inst in INSTANCES:
-        log.info(f"  [{inst.name}]  exe={inst.exe}  mdb={inst.public_mdb}")
-    log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
-    log.info(f"  Extensions  : {', '.join(sorted(WATCHED_EXTENSIONS))}")
+    for sf in _SIGNAL_FILE.values():
+        try:
+            sf.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    log.info("═" * 60)
+    log.info(f"Startup {BOX_NAME} — initial mode: [{mode}]")
+    log.info(f"  Source    : {SOURCE_DIR}")
+    log.info(f"  Orphans   : {ORPHAN_DIR}")
+    for i in INSTANCES:
+        log.info(f"  [{i.name}]  exe  : {i.exe_path}")
+        log.info(f"  [{i.name}]  mdb  : {i.public_mdb}")
+    log.info(f"  Timeout   : {PATIENT_WAIT_TIMEOUT // 60} min")
+    log.info(f"  Extensions: {', '.join(sorted(WATCHED_EXTENSIONS))}")
+    log.info("═" * 60)
+
+    _launch_studiovision(inst)
 
     file_queue: queue.Queue = queue.Queue()
 
     threading.Thread(
         target=worker, args=(file_queue,), name="Worker", daemon=True
     ).start()
-
     threading.Thread(
         target=_run_background, args=(file_queue,), name="Background", daemon=True
     ).start()
 
     if not TRAY_AVAILABLE:
-        log.warning("pystray/Pillow not available — running without system tray.")
+        log.warning("pystray/Pillow not available — running without systray icon.")
         try:
             while not _stop_event.is_set():
                 time.sleep(1)
         except KeyboardInterrupt:
-            log.info("Shutdown requested.")
+            log.info("Exit requested.")
         finally:
             _stop_event.set()
         return
 
-    # ── Build pystray menu ────────────────────────────────────────────────
-    menu = pystray.Menu(
-        # Non-clickable status line
-        pystray.MenuItem(
-            text=lambda item: _status_text,
-            action=None,
-            enabled=False,
-        ),
-        pystray.Menu.SEPARATOR,
-        # Radio-style instance selector
-        pystray.MenuItem(
-            "Base de données",
-            _make_instance_menu(),
-        ),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Ouvrir les logs", _open_logs),
-        pystray.MenuItem("Quitter", _quit),
-    )
-
     _icon = pystray.Icon(
         name=BOX_NAME,
-        icon=_make_icon(_COLOR_READY),
+        icon=_make_icon_image(_COLOR_READY),
         title=BOX_NAME,
-        menu=menu,
+        menu=_build_menu(),
     )
 
-    log.info("System tray icon started.")
+    log.info("Systray icon started.")
     _icon.run()
 
     _stop_event.set()

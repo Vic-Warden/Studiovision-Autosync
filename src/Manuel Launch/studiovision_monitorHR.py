@@ -825,10 +825,9 @@ def main() -> None:
         if sv_running:
             ctypes.windll.user32.MessageBoxW(
                 0,
-                "Pour relancer le routeur d'images, veuillez fermer complètement "
-                "puis relancer Studio Vision.",
-                "Routeur d'images",
-                0x30,  # MB_ICONWARNING | MB_OK
+                "To restart the image router, please fully close and relaunch Studio Vision.",
+                "Image Router",
+                0x30,
             )
             sys.exit(0)
 
@@ -880,9 +879,16 @@ def main() -> None:
     ).start()
 
     if not TRAY_AVAILABLE:
-        log.info("Mode invisible activé. Lancement de Studio Vision HR...")
-        
-        # La commande exacte pour lancer ta base HR
+        log.info("Headless mode — launching Studio Vision HR...")
+
+        # Launch the image router dispatcher alongside Studio Vision
+        triage_script = r"C:\Chemin\Vers\Ton\Dossier\studiovision_export.py"
+        try:
+            subprocess.Popen(["pythonw.exe", triage_script])
+            log.info("Dispatcher launched.")
+        except Exception as e:
+            log.error(f"Could not launch dispatcher: {e}")
+
         cmd_hr = [
             r"C:\Studiov2000\Svprog\MSACCESS.EXE",
             "/runtime", r"C:\Studiov2000\svprog\Ophprog.mde",
@@ -891,19 +897,18 @@ def main() -> None:
         ]
 
         try:
-            # On lance Studio Vision HR. 
-            # subprocess.run bloque l'exécution du script tant que le logiciel reste ouvert.
+            # Blocks until Studio Vision is closed by the user
             subprocess.run(cmd_hr, check=False)
-            log.info("Studio Vision HR a été fermé par l'utilisateur.")
+            log.info("Studio Vision HR closed.")
         except FileNotFoundError:
-            log.error("Erreur : L'exécutable MSACCESS.EXE ou Studio Vision HR est introuvable.")
+            log.error("MSACCESS.EXE or Studio Vision HR not found.")
         except Exception as e:
-            log.error(f"Erreur lors du lancement de Studio Vision HR : {e}")
+            log.error(f"Error launching Studio Vision HR: {e}")
         finally:
-            # Dès que Studio Vision HR se ferme, on coupe proprement le moniteur Python
+            # Stop the monitor when the application exits or crashes
             _stop_event.set()
-            log.info("Arrêt du moniteur HR synchronisé avec la fermeture du logiciel.")
-            
+            log.info("HR monitor stopped (synced with application exit.")
+
         return
 
     menu = pystray.Menu(
@@ -913,9 +918,9 @@ def main() -> None:
             enabled=False,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Ouvrir le log technique", _open_logs),
-        pystray.MenuItem("Ouvrir le rapport médecin", _open_medecin_log),
-        pystray.MenuItem("Quitter", _quit),
+        pystray.MenuItem("Open technical log", _open_logs),
+        pystray.MenuItem("Open doctor report", _open_medecin_log),
+        pystray.MenuItem("Quit", _quit),
     )
 
     _icon = pystray.Icon(

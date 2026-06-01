@@ -2,7 +2,7 @@
 Routes incoming imaging files to the correct patient folder,
 inserts a DB record, and refreshes the Access UI.
 
-Pipeline: PollingObserver → file_queue → Worker → Access DB + UI refresh
+Pipeline: PollingObserver -> file_queue -> Worker -> Access DB + UI refresh
           (1.5s burst debounce, auto-reconnect on network drop)
 
 New in v5:
@@ -10,6 +10,13 @@ New in v5:
   - Progressive retry queue on DB failure
   - Smart post-commit delay before Requery/MoveLast
   - Simplified doctor log in French (rapport_medecin_YYYY-MM-DD.txt)
+
+Fixed in v5.1:
+  - TRAY_AVAILABLE now correctly set to True on successful pystray import
+  - ImageProducer: added on_modified handler + deduplication seen-set
+  - _scan_source_for_missed_files: replaced rglob with flat iterdir
+  - worker: orphan timeout path wrapped in try/finally to guarantee task_done()
+  - _run_background: observer scheduled with recursive=False (staging folder is flat)
 
 Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
 """
@@ -44,7 +51,7 @@ except ImportError:
 try:
     import pystray
     from PIL import Image, ImageDraw
-    TRAY_AVAILABLE = False
+    TRAY_AVAILABLE = True   # Correctly reflects successful import
 except ImportError:
     TRAY_AVAILABLE = False
 
@@ -54,8 +61,7 @@ import winerror
 import psutil
 
 # Configuration
-BOX_NAME    = "Studiovision"
-
+BOX_NAME          = "Studiovision"
 STUDIO_VISION_EXE = "studiovision.exe"
 
 SOURCE_DIR  = Path(r"C:\Users\Box-6\Desktop\HR")
@@ -113,8 +119,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("image_router")
 
-# Doctor log (simplified, in French)
 
+# Doctor log (simplified, in French)
 def _get_medecin_log_path() -> Path:
     """Returns the path to today's doctor report."""
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -135,9 +141,9 @@ def log_medecin(message: str) -> None:
 # System tray
 _NETWORK_SHARE_POLL = 10
 
-_ICON_SIZE     = 64
-_COLOR_READY   = (30, 144, 255)
-_COLOR_ACTIVE  = (50, 205, 50)
+_ICON_SIZE    = 64
+_COLOR_READY  = (30, 144, 255)
+_COLOR_ACTIVE = (50, 205, 50)
 
 _icon: "pystray.Icon | None" = None
 _status_text: str             = "Starting..."
@@ -360,7 +366,7 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
             return
 
         if expected_patient_code is not None:
-            current = get_active_patient()
+            current      = get_active_patient()
             current_code = current["code"] if current else None
             if current_code != expected_patient_code:
                 log.warning(
@@ -488,7 +494,7 @@ _retry_lock  = threading.Lock()
 
 def _schedule_retry(file: Path, patient: dict, relative_path: str,
                     description: str, attempt: int = 0) -> None:
-    """Schedules a failed insert for retry with progressive delay. Orphans the file after max attempts."""
+    """Schedules a failed insert for retry with progressive delay. Orphans after max attempts."""
     if attempt >= len(RETRY_DELAYS):
         log.error(
             f"Max retry attempts reached for '{file.name}' "
@@ -501,9 +507,9 @@ def _schedule_retry(file: Path, patient: dict, relative_path: str,
         orphan_file(file)
         return
 
-    delay      = RETRY_DELAYS[attempt]
-    next_try   = time.monotonic() + delay
-    entry      = {
+    delay    = RETRY_DELAYS[attempt]
+    next_try = time.monotonic() + delay
+    entry    = {
         "file":          file,
         "patient":       patient,
         "relative_path": relative_path,
@@ -527,7 +533,7 @@ def _schedule_retry(file: Path, patient: dict, relative_path: str,
 
 def _process_retry_queue(file_queue: queue.Queue) -> None:
     """Processes due retry entries. On success triggers a UI refresh; on failure reschedules."""
-    now = time.monotonic()
+    now      = time.monotonic()
     to_retry: list[dict] = []
 
     with _retry_lock:
@@ -565,14 +571,15 @@ def _process_retry_queue(file_queue: queue.Queue) -> None:
 
 # Startup scan and periodic catchup
 def _scan_source_for_missed_files(file_queue: queue.Queue) -> None:
-    """Scans SOURCE_DIR for files missed during downtime and enqueues them."""
+    """Enqueues files present in SOURCE_DIR that were missed during downtime.
+    Uses a flat scan: SOURCE_DIR is a staging folder, not a tree."""
     if not SOURCE_DIR.is_dir():
         log.warning(f"Catchup scan skipped: {SOURCE_DIR} not accessible.")
         return
 
-    found = []
+    found: list[Path] = []
     try:
-        for item in SOURCE_DIR.rglob("*"):
+        for item in SOURCE_DIR.iterdir():       # Flat scan only — SOURCE_DIR is not a tree
             if item.is_file() and item.suffix.lower() in WATCHED_EXTENSIONS:
                 found.append(item)
     except Exception as e:
@@ -586,7 +593,7 @@ def _scan_source_for_missed_files(file_queue: queue.Queue) -> None:
     log.info(f"Catchup scan: {len(found)} file(s) found, enqueuing.")
     for f in found:
         file_queue.put(f)
-        log.info(f"  Catchup → enqueued: {f.name}")
+        log.info(f"  Catchup -> enqueued: {f.name}")
 
 
 def _catchup_loop(file_queue: queue.Queue) -> None:
@@ -625,7 +632,7 @@ def worker(file_queue: queue.Queue) -> None:
                 if needs_refresh:
                     log.info("Burst complete — triggering batched UI refresh.")
                     refresh_ui(expected_patient_code=last_patient_code)
-                    needs_refresh = False
+                    needs_refresh     = False
                     last_patient_code = None
                     _notify(
                         "Transfer complete",
@@ -666,13 +673,17 @@ def worker(file_queue: queue.Queue) -> None:
 
                 elapsed = time.monotonic() - start_time
                 if elapsed >= PATIENT_WAIT_TIMEOUT:
-                    orphan_file(file)
-                    _notify("Orphan file", file.name)
-                    log_medecin(
-                        f"AVERTISSEMENT : Fichier '{file.name}' orphelin "
-                        f"(aucun patient ouvert après {PATIENT_WAIT_TIMEOUT // 60} min)."
-                    )
-                    file_queue.task_done()
+                    # Wrap in try/finally to guarantee task_done() even if orphan_file raises,
+                    # preventing file_queue.join() from blocking indefinitely on shutdown.
+                    try:
+                        orphan_file(file)
+                        _notify("Orphan file", file.name)
+                        log_medecin(
+                            f"AVERTISSEMENT : Fichier '{file.name}' orphelin "
+                            f"(aucun patient ouvert après {PATIENT_WAIT_TIMEOUT // 60} min)."
+                        )
+                    finally:
+                        file_queue.task_done()
                     patient = None
                     break
 
@@ -746,28 +757,72 @@ def worker(file_queue: queue.Queue) -> None:
 
 # Watchdog producer
 class ImageProducer(FileSystemEventHandler):
+    """Watchdog event handler for the HR staging folder.
+
+    PollingObserver detects files arriving via shutil.move() as FileCreatedEvent
+    because it diffs directory snapshots rather than observing OS rename calls.
+    on_moved is retained as a defensive fallback.
+    on_modified handles the edge case where PollingObserver emits a modified event
+    before created when a file is written in chunks.
+    A short-lived seen-set prevents duplicate enqueuing if multiple event types
+    fire for the same path within the same poll cycle.
+    """
+
     def __init__(self, file_queue: queue.Queue) -> None:
         super().__init__()
-        self._queue = file_queue
+        self._queue     = file_queue
+        self._seen: set[str] = set()
+        self._seen_lock = threading.Lock()
+
+    def _enqueue(self, path: Path, reason: str) -> None:
+        """Thread-safe enqueue with 5-second deduplication window."""
+        key = str(path)
+        with self._seen_lock:
+            if key in self._seen:
+                log.debug(f"Duplicate event suppressed ({reason}): {path.name}")
+                return
+            self._seen.add(key)
+
+        # Remove the key after the deduplication window so the same filename
+        # can be re-enqueued if it reappears later (e.g. after a retry).
+        def _clear_key():
+            time.sleep(5)
+            with self._seen_lock:
+                self._seen.discard(key)
+
+        threading.Thread(target=_clear_key, daemon=True).start()
+
+        log.info(f"Enqueued ({reason}): {path.name} (queue size: {self._queue.qsize() + 1})")
+        self._queue.put(path)
 
     def on_created(self, event) -> None:
         if event.is_directory:
             return
-        file = Path(event.src_path)
-        if file.suffix.lower() not in WATCHED_EXTENSIONS:
+        path = Path(event.src_path)
+        if path.suffix.lower() not in WATCHED_EXTENSIONS:
             return
-        log.info(f"Enqueued (created): {file.name} (queue size: {self._queue.qsize() + 1})")
-        self._queue.put(file)
+        self._enqueue(path, "created")
 
-    # Handles files moved into SOURCE_DIR by the dispatcher
     def on_moved(self, event) -> None:
+        # Fires when a same-volume rename is observed at the OS level.
+        # With PollingObserver this is uncommon but retained for correctness.
         if event.is_directory:
             return
-        file = Path(event.dest_path)
-        if file.suffix.lower() not in WATCHED_EXTENSIONS:
+        path = Path(event.dest_path)
+        if path.suffix.lower() not in WATCHED_EXTENSIONS:
             return
-        log.info(f"Enqueued (moved): {file.name} (queue size: {self._queue.qsize() + 1})")
-        self._queue.put(file)
+        self._enqueue(path, "moved")
+
+    def on_modified(self, event) -> None:
+        # PollingObserver may emit modified before created for chunked writes.
+        # Only enqueue if the file is already present on disk.
+        if event.is_directory:
+            return
+        path = Path(event.src_path)
+        if path.suffix.lower() not in WATCHED_EXTENSIONS:
+            return
+        if path.exists():
+            self._enqueue(path, "modified")
 
 
 # Background thread (watchdog + network reconnect)
@@ -776,7 +831,8 @@ def _run_background(file_queue: queue.Queue) -> None:
 
     def _start_observer() -> Observer:
         obs = Observer()
-        obs.schedule(ImageProducer(file_queue), str(SOURCE_DIR), recursive=True)
+        # recursive=False: SOURCE_DIR is a flat staging folder.
+        obs.schedule(ImageProducer(file_queue), str(SOURCE_DIR), recursive=False)
         obs.start()
         log.info("Observer started — watching for images.")
         return obs
@@ -849,7 +905,7 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Version 5 started")
+    log.info("Version 5.1 started (HR)")
     log.info(f"  Source     : {SOURCE_DIR}")
     log.info(f"  Dest       : {DEST_PHOTOS}")
     log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
@@ -863,7 +919,7 @@ def main() -> None:
     log.info(f"  Doctor log : {_get_medecin_log_path()}")
 
     log_medecin(
-        f"Démarrage du routeur d'images (version 5). "
+        f"Démarrage du routeur d'images (version 5.1 HR). "
         f"Surveillance de : {SOURCE_DIR}"
     )
 
@@ -891,7 +947,6 @@ def main() -> None:
     if not TRAY_AVAILABLE:
         log.info("Headless mode — launching Studio Vision HR...")
 
-        # Launch the image router dispatcher alongside Studio Vision
         triage_script = r"C:\Chemin\Vers\Ton\Dossier\studiovision_export.py"
         try:
             subprocess.Popen(["pythonw.exe", triage_script])
@@ -907,7 +962,7 @@ def main() -> None:
         ]
 
         try:
-            # Blocks until Studio Vision is closed by the user
+            # Blocks until Studio Vision HR is closed by the user
             subprocess.run(cmd_hr, check=False)
             log.info("Studio Vision HR closed.")
         except FileNotFoundError:
@@ -917,7 +972,7 @@ def main() -> None:
         finally:
             # Stop the monitor when the application exits or crashes
             _stop_event.set()
-            log.info("HR monitor stopped (synced with application exit.")
+            log.info("HR monitor stopped (synced with application exit).")
 
         return
 
@@ -946,6 +1001,7 @@ def main() -> None:
     _stop_event.set()
     log.info("Application stopped.")
     log_medecin("Arrêt du routeur d'images.")
+
 
 if __name__ == "__main__":
     main()

@@ -11,7 +11,6 @@ import queue
 import threading
 import logging
 import sys
-import ctypes
 from pathlib import Path
 
 from watchdog.observers.polling import PollingObserver as Observer
@@ -35,22 +34,26 @@ for d in [SOURCE_DIR, DEST_OM, DEST_HR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # State
-_state_lock = threading.Lock()
+_state_lock     = threading.Lock()
 _current_target = "OM"  # Default on startup
-_stop_event = threading.Event()
-_icon = None
-_mutex_handle = None
+_stop_event     = threading.Event()
+_icon           = None
+_mutex_handle   = None
 
 COLOR_OM = (30, 144, 255)  # Blue
 COLOR_HR = (50, 205, 50)   # Green
 
 # Logging
-log_file = Path(os.path.expanduser("~")) / "studiovision" / "triage.log"
+log_dir  = Path(os.path.expanduser("~")) / "studiovision"
+log_dir.mkdir(parents=True, exist_ok=True)
+log_file = log_dir / "triage.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(message)s",
     handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler()]
 )
+
 
 # File routing
 def wait_for_file(file_path: Path, retries=10, delay=1) -> bool:
@@ -61,6 +64,7 @@ def wait_for_file(file_path: Path, retries=10, delay=1) -> bool:
         except (PermissionError, OSError):
             time.sleep(delay)
     return False
+
 
 def worker_triage(file_queue: queue.Queue):
     logging.info("Triage worker started.")
@@ -81,7 +85,7 @@ def worker_triage(file_queue: queue.Queue):
         dest_file = dest_folder / file_path.name
 
         if dest_file.exists():
-            ts = int(time.time())
+            ts        = int(time.time())
             dest_file = dest_folder / f"{file_path.stem}_{ts}{file_path.suffix}"
 
         try:
@@ -93,6 +97,7 @@ def worker_triage(file_queue: queue.Queue):
             logging.error(f"Move error for {file_path.name}: {e}")
 
         file_queue.task_done()
+
 
 # Watchdog producer
 class SourceHandler(FileSystemEventHandler):
@@ -115,13 +120,15 @@ class SourceHandler(FileSystemEventHandler):
             logging.info(f"New file (moved): {file_path.name}")
             self.q.put(file_path)
 
+
 # System tray
 def create_image(color):
-    size = 64
-    image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
+    size  = 64
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw  = ImageDraw.Draw(image)
     draw.ellipse((4, 4, size - 4, size - 4), fill=color)
     return image
+
 
 def set_target(icon, item):
     global _current_target
@@ -135,18 +142,30 @@ def set_target(icon, item):
     logging.info(f"Mode changed: routing to {_current_target}")
     icon.notify("Destination changed", f"Next images will go to {_current_target}")
 
+
 def is_checked(target):
     def check(item):
         with _state_lock:
             return _current_target == target
     return check
 
+
 def quit_app(icon, item):
     _stop_event.set()
     icon.stop()
 
+
 def open_source_folder(icon, item):
     os.startfile(str(SOURCE_DIR))
+
+
+def open_logs_folder(icon, item):
+    """Opens the studiovision log directory in Explorer."""
+    try:
+        os.startfile(str(log_dir))
+    except Exception as e:
+        logging.warning(f"Could not open logs folder: {e}")
+
 
 # Entry point
 def main():
@@ -167,9 +186,10 @@ def main():
 
     menu = pystray.Menu(
         pystray.MenuItem("Open export folder", open_source_folder),
+        pystray.MenuItem("Open logs folder",   open_logs_folder),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("-> Send to OM folder (Blue)", set_target, radio=True, checked=is_checked("OM")),
-        pystray.MenuItem("-> Send to HR folder (Green)", set_target, radio=True, checked=is_checked("HR")),
+        pystray.MenuItem("-> Send to OM folder (Blue)",   set_target, radio=True, checked=is_checked("OM")),
+        pystray.MenuItem("-> Send to HR folder (Green)",  set_target, radio=True, checked=is_checked("HR")),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", quit_app)
     )
@@ -187,6 +207,7 @@ def main():
 
     observer.stop()
     observer.join()
+
 
 if __name__ == "__main__":
     main()

@@ -104,7 +104,15 @@ class SourceHandler(FileSystemEventHandler):
             return
         file_path = Path(event.src_path)
         if file_path.suffix.lower() in WATCHED_EXTENSIONS:
-            logging.info(f"New file detected: {file_path.name}")
+            logging.info(f"New file (created): {file_path.name}")
+            self.q.put(file_path)
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        file_path = Path(event.dest_path)
+        if file_path.suffix.lower() in WATCHED_EXTENSIONS:
+            logging.info(f"New file (moved): {file_path.name}")
             self.q.put(file_path)
 
 # System tray

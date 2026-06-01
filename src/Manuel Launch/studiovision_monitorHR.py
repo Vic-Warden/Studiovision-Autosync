@@ -23,6 +23,7 @@ import threading
 import time
 import ctypes
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from watchdog.observers.polling import PollingObserver as Observer
@@ -43,7 +44,7 @@ except ImportError:
 try:
     import pystray
     from PIL import Image, ImageDraw
-    TRAY_AVAILABLE = True
+    TRAY_AVAILABLE = False
 except ImportError:
     TRAY_AVAILABLE = False
 
@@ -879,14 +880,30 @@ def main() -> None:
     ).start()
 
     if not TRAY_AVAILABLE:
-        log.warning("pystray/Pillow not available — running without system tray.")
+        log.info("Mode invisible activé. Lancement de Studio Vision HR...")
+        
+        # La commande exacte pour lancer ta base HR
+        cmd_hr = [
+            r"C:\Studiov2000\Svprog\MSACCESS.EXE",
+            "/runtime", r"C:\Studiov2000\svprog\Ophprog.mde",
+            "/wrkgrp",  r"C:\Studiov2000\config\system.mdw",
+            "/User", "/Pwd", "/X", "demarrage"
+        ]
+
         try:
-            while not _stop_event.is_set():
-                time.sleep(1)
-        except KeyboardInterrupt:
-            log.info("Shutdown requested.")
+            # On lance Studio Vision HR. 
+            # subprocess.run bloque l'exécution du script tant que le logiciel reste ouvert.
+            subprocess.run(cmd_hr, check=False)
+            log.info("Studio Vision HR a été fermé par l'utilisateur.")
+        except FileNotFoundError:
+            log.error("Erreur : L'exécutable MSACCESS.EXE ou Studio Vision HR est introuvable.")
+        except Exception as e:
+            log.error(f"Erreur lors du lancement de Studio Vision HR : {e}")
         finally:
+            # Dès que Studio Vision HR se ferme, on coupe proprement le moniteur Python
             _stop_event.set()
+            log.info("Arrêt du moniteur HR synchronisé avec la fermeture du logiciel.")
+            
         return
 
     menu = pystray.Menu(

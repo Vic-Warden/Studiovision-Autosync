@@ -149,15 +149,6 @@ def main():
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 
-    # Startup notification
-    ctypes.windll.user32.MessageBoxW(
-        0,
-        "Image Router started!\n\n"
-        "Right-click the tray icon to select the destination folder (OM or HR).",
-        "StudioVision - Image Router",
-        0x40
-    )
-
     q = queue.Queue()
     threading.Thread(target=worker_triage, args=(q,), daemon=True).start()
 
@@ -176,7 +167,15 @@ def main():
     )
 
     _icon = pystray.Icon("VisualFieldTriage", create_image(COLOR_OM), "Image Router", menu=menu)
-    _icon.run()
+
+    def on_ready(icon):
+        icon.visible = True
+        icon.notify(
+            "Right-click the tray icon to select the destination folder (OM or HR).",
+            "Image Router started"
+        )
+
+    _icon.run(setup=on_ready)
 
     observer.stop()
     observer.join()

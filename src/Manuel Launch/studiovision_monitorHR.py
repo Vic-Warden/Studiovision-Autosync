@@ -756,7 +756,17 @@ class ImageProducer(FileSystemEventHandler):
         file = Path(event.src_path)
         if file.suffix.lower() not in WATCHED_EXTENSIONS:
             return
-        log.info(f"Enqueued: {file.name} (queue size: {self._queue.qsize() + 1})")
+        log.info(f"Enqueued (created): {file.name} (queue size: {self._queue.qsize() + 1})")
+        self._queue.put(file)
+
+    # Handles files moved into SOURCE_DIR by the dispatcher
+    def on_moved(self, event) -> None:
+        if event.is_directory:
+            return
+        file = Path(event.dest_path)
+        if file.suffix.lower() not in WATCHED_EXTENSIONS:
+            return
+        log.info(f"Enqueued (moved): {file.name} (queue size: {self._queue.qsize() + 1})")
         self._queue.put(file)
 
 
@@ -807,7 +817,7 @@ def main() -> None:
     global _icon, _mutex_handle
 
     # Single-instance guard
-    _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_Mutex")
+    _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_HR_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 

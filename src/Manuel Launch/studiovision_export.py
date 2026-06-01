@@ -10,12 +10,19 @@ import time
 import queue
 import threading
 import logging
+import sys
+import ctypes
 from pathlib import Path
 
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
 import pystray
 from PIL import Image, ImageDraw
+
+# Windows single-instance mutex
+import win32api
+import win32event
+import winerror
 
 # Configuration
 SOURCE_DIR = Path(r"C:\Users\Box-6\Desktop\Export CV")
@@ -32,6 +39,7 @@ _state_lock = threading.Lock()
 _current_target = "OM"  # Default on startup
 _stop_event = threading.Event()
 _icon = None
+_mutex_handle = None
 
 COLOR_OM = (30, 144, 255)  # Blue
 COLOR_HR = (50, 205, 50)   # Green
@@ -46,7 +54,6 @@ logging.basicConfig(
 
 # File routing
 def wait_for_file(file_path: Path, retries=10, delay=1) -> bool:
-    """Waits until the file is fully written and readable."""
     for _ in range(retries):
         try:
             with file_path.open("rb"):
@@ -56,7 +63,6 @@ def wait_for_file(file_path: Path, retries=10, delay=1) -> bool:
     return False
 
 def worker_triage(file_queue: queue.Queue):
-    """Dequeues files and moves them to the active destination folder."""
     logging.info("Triage worker started.")
     while not _stop_event.is_set():
         try:
@@ -103,7 +109,6 @@ class SourceHandler(FileSystemEventHandler):
 
 # System tray
 def create_image(color):
-    """Generates a solid-circle tray icon."""
     size = 64
     image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -111,7 +116,6 @@ def create_image(color):
     return image
 
 def set_target(icon, item):
-    """Switches the active destination folder."""
     global _current_target
     with _state_lock:
         if "OM" in item.text:
@@ -124,7 +128,6 @@ def set_target(icon, item):
     icon.notify("Destination changed", f"Next images will go to {_current_target}")
 
 def is_checked(target):
-    """Returns a checker function for the tray radio menu."""
     def check(item):
         with _state_lock:
             return _current_target == target
@@ -139,7 +142,21 @@ def open_source_folder(icon, item):
 
 # Entry point
 def main():
-    global _icon
+    global _icon, _mutex_handle
+
+    # Single-instance guard
+    _mutex_handle = win32event.CreateMutex(None, False, "StudioVision_Export_Triage_Mutex")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        sys.exit(0)
+
+    # Startup notification
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        "Image Router started!\n\n"
+        "Right-click the tray icon to select the destination folder (OM or HR).",
+        "StudioVision - Image Router",
+        0x40
+    )
 
     q = queue.Queue()
     threading.Thread(target=worker_triage, args=(q,), daemon=True).start()
@@ -151,12 +168,14 @@ def main():
 
     menu = pystray.Menu(
         pystray.MenuItem("Open export folder", open_source_folder),
-        pystray.MenuItem("-> Send to OM Folder (Blue)", set_target, radio=True, checked=is_checked("OM")),
-        pystray.MenuItem("-> Send to HR Folder (Green)", set_target, radio=True, checked=is_checked("HR")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("-> Send to OM folder (Blue)", set_target, radio=True, checked=is_checked("OM")),
+        pystray.MenuItem("-> Send to HR folder (Green)", set_target, radio=True, checked=is_checked("HR")),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", quit_app)
     )
 
-    _icon = pystray.Icon("VisualFieldTriage", create_image(COLOR_OM), "Visual Field Router", menu=menu)
+    _icon = pystray.Icon("VisualFieldTriage", create_image(COLOR_OM), "Image Router", menu=menu)
     _icon.run()
 
     observer.stop()

@@ -915,6 +915,5 @@ def main() -> None:
     log.info("Application stopped.")
     log_medecin("Arrêt du routeur d'images.")
 
-
 if __name__ == "__main__":
     main()

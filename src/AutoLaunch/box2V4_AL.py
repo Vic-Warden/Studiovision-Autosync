@@ -1,15 +1,19 @@
 """
-Box 1 + specialised handling for the Nidek OCT scanner (folder-per-acquisition).
+Box 2 + specialised handling for the Nidek OCT scanner (folder-per-acquisition).
+Version 5:
+  - Independent catch-up scan loop
+  - Progressive retry queue on DB failure
+  - Smart post-commit delay before Requery/MoveLast
+  - Simplified doctor log (rapport_oct_medecin_YYYY-MM-DD.txt)
 
 Nidek pipeline:
   1. File grandparent == SOURCE_DIR  →  identified as Nidek.
-  2. First file of a scan: wait 2 s, delete XML sidecars, keep only the largest
-     image (high-res); discard thumbnails.
+  2. First file of a scan: wait 2s, delete XML sidecars, keep only the largest image; discard thumbnails.
   3. Already-processed scan folders: delete residual files instead of re-inserting.
   4. Remove empty scan_dir / main_dir after transfer.
 
 Pipeline: PollingObserver → file_queue → Worker → Access DB + UI refresh
-          (1.5 s burst debounce, auto-reconnect on network drop)
+          (1.5s burst debounce, auto-reconnect on network drop)
 
 Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
 """
@@ -52,8 +56,7 @@ import win32event
 import winerror
 import psutil
 
-#  Configuration
-
+# Configuration
 BOX_NAME    = "Box 2"
 
 STUDIO_VISION_EXE = "studiovision.exe"
@@ -92,6 +95,14 @@ EXAM_DESCRIPTION = {
     ".odt":  "Document",
 }
 
+# Progressive retry delays (seconds); max attempts = len(_RETRY_DELAYS)
+_RETRY_DELAYS  = [10, 30, 60, 120, 300]
+_RETRY_QUEUE: "queue.Queue[dict]" = queue.Queue()
+
+# Interval (seconds) between full SOURCE_DIR catch-up scans
+_CATCHUP_INTERVAL = 60
+
+# Logging
 _LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _LOG_FILE = _LOG_DIR / "image_router.log"
@@ -107,12 +118,30 @@ logging.basicConfig(
 )
 log = logging.getLogger("image_router")
 
-_NETWORK_SHARE_POLL = 10
+# Doctor log (simplified, in French)
+def _get_medecin_log_path() -> Path:
+    """Returns the path to today's doctor report."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return _LOG_DIR / f"rapport_oct_medecin_{today}.txt"
+
+
+def _log_medecin(message: str) -> None:
+    """Appends a timestamped line to the daily doctor report."""
+    heure = datetime.now().strftime("%Hh%M")
+    ligne = f"[{heure}] {message}\n"
+    try:
+        with open(_get_medecin_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(ligne)
+    except Exception as e:
+        log.warning(f"Could not write to doctor report: {e}")
+
 
 # System tray
+_NETWORK_SHARE_POLL = 10
+
 _ICON_SIZE     = 64
-_COLOR_READY   = (30, 144, 255)   # dodger blue
-_COLOR_ACTIVE  = (50, 205, 50)    # lime green
+_COLOR_READY   = (30, 144, 255)
+_COLOR_ACTIVE  = (50, 205, 50)
 
 _icon: "pystray.Icon | None" = None
 _status_text: str             = "Starting..."
@@ -122,7 +151,7 @@ _mutex_handle = None
 
 
 def _make_icon(color: tuple) -> "Image.Image":
-    """Generate a solid-circle tray icon with Pillow (no external .ico needed)."""
+    """Generate a solid-circle tray icon (no external .ico needed)."""
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     margin = 4
@@ -164,6 +193,8 @@ def _quit(icon, item) -> None:  # noqa: ARG001
     _stop_event.set()
     icon.stop()
 
+
+# Network
 def wait_for_network_share() -> None:
     is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
     if not is_network:
@@ -177,9 +208,10 @@ def wait_for_network_share() -> None:
         )
         time.sleep(_NETWORK_SHARE_POLL)
     if attempt:
-        log.info(f"Network share is now accessible after {attempt} attempt(s): {SOURCE_DIR}")
+        log.info(f"Network share accessible after {attempt} attempt(s): {SOURCE_DIR}")
 
 
+# Access database
 def db_connect(mdb_path: Path):
     return pyodbc.connect(
         f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
@@ -260,6 +292,7 @@ def find_patient_folder(patient_code: str) -> Path | None:
 
 
 def insert_document(patient: dict, relative_path: str, description: str) -> bool:
+    """Inserts a document record into the DB. Returns True on success."""
     if not PYODBC_AVAILABLE:
         log.warning("pyodbc not available, insert skipped.")
         return False
@@ -289,6 +322,111 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
         return False
 
 
+# Retry worker for deferred DB inserts
+def _retry_worker() -> None:
+    """Retries failed inserts with progressive delays. Orphans the file after all attempts are exhausted."""
+    log.info("RetryWorker started.")
+    while not _stop_event.is_set():
+        try:
+            item = _RETRY_QUEUE.get(timeout=2)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log.error(f"RetryQueue error: {e}")
+            continue
+
+        patient       = item["patient"]
+        relative_path = item["relative_path"]
+        description   = item["description"]
+        attempt       = item.get("attempt", 0)
+        dest_file     = item.get("dest_file")
+
+        if attempt >= len(_RETRY_DELAYS):
+            log.error(
+                f"[RETRY] Max attempts reached: "
+                f"patient={patient['code']} path='{relative_path}'"
+            )
+            _log_medecin(
+                f"ERREUR : Impossible d'enregistrer l'examen de "
+                f"{patient['nom']} {patient['prenom']} (Code: {patient['code']}) "
+                f"— réseau indisponible après {attempt} tentatives. "
+                f"Fichier déplacé en quarantaine."
+            )
+            if dest_file and Path(dest_file).exists():
+                orphan_file(Path(dest_file))
+                _notify("Erreur DB critique", f"Fichier orphelin : {Path(dest_file).name}")
+            _RETRY_QUEUE.task_done()
+            continue
+
+        delay = _RETRY_DELAYS[attempt]
+        log.info(
+            f"[RETRY] Attempt {attempt + 1}/{len(_RETRY_DELAYS)} in {delay}s "
+            f"for patient={patient['code']}..."
+        )
+        _log_medecin(
+            f"ERREUR : Impossible d'ajouter l'examen de "
+            f"{patient['nom']} {patient['prenom']} (Code: {patient['code']}) "
+            f"— Réseau déconnecté, nouvelle tentative dans {delay}s…"
+        )
+
+        # Non-blocking wait: check _stop_event every second
+        for _ in range(delay):
+            if _stop_event.is_set():
+                break
+            time.sleep(1)
+
+        if _stop_event.is_set():
+            _RETRY_QUEUE.task_done()
+            break
+
+        if insert_document(patient, relative_path, description):
+            log.info(
+                f"[RETRY] Success on attempt {attempt + 1}: "
+                f"patient={patient['code']} path='{relative_path}'"
+            )
+            _log_medecin(
+                f"SUCCÈS (rattrapage) : Scan OCT ajouté au dossier de "
+                f"{patient['nom']} {patient['prenom']} (Code: {patient['code']})."
+            )
+            try:
+                refresh_ui(expected_patient_code=patient["code"])
+            except Exception as e:
+                log.debug(f"[RETRY] refresh_ui after retry: {e}")
+        else:
+            _RETRY_QUEUE.put({
+                "patient":       patient,
+                "relative_path": relative_path,
+                "description":   description,
+                "attempt":       attempt + 1,
+                "dest_file":     dest_file,
+            })
+
+        _RETRY_QUEUE.task_done()
+
+    log.info("RetryWorker stopped.")
+
+
+def enqueue_retry(
+    patient: dict,
+    relative_path: str,
+    description: str,
+    dest_file: "Path | None" = None,
+) -> None:
+    """Adds a failed insert to the retry queue."""
+    _RETRY_QUEUE.put({
+        "patient":       patient,
+        "relative_path": relative_path,
+        "description":   description,
+        "attempt":       0,
+        "dest_file":     str(dest_file) if dest_file else None,
+    })
+    log.info(
+        f"[RETRY] Enqueued for retry: "
+        f"patient={patient['code']} path='{relative_path}'"
+    )
+
+
+# Access UI refresh
 _AC_SUBFORM = 112
 
 
@@ -309,8 +447,17 @@ def _find_sfdoc(form):
 
 
 def refresh_ui(expected_patient_code: str | None = None) -> None:
+    """
+    Refreshes the Access UI after an INSERT.
+    Waits 0.5s after commit to allow Jet/ACE to finalize the write,
+    then calls MoveLast() to select the newly inserted record.
+    """
     if not WIN32_AVAILABLE:
         return
+
+    # Allow Jet/ACE to propagate the commit before querying
+    time.sleep(0.5)
+
     try:
         access = win32com.client.GetActiveObject("Access.Application")
         form   = access.Screen.ActiveForm
@@ -344,7 +491,7 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
 
         try:
             if form.Dirty:
-                log.info("Parent form is in edit mode (Dirty=True); clearing Dirty before Requery.")
+                log.info("Parent form is dirty; clearing before Requery.")
                 form.Dirty = False
         except Exception as e_dirty:
             log.debug(f"Dirty check/clear failed ({e_dirty}), continuing...")
@@ -380,9 +527,12 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
                     f"Fallback Refresh() also failed on '{SFDOC_SUBFORM_NAME}': {e_ref2}"
                 )
 
+        # Extra delay before MoveLast to ensure the recordset is fully reloaded
+        time.sleep(0.3)
+
         try:
             sfdoc.Recordset.MoveLast()
-            log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}'")
+            log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}' — last record selected.")
         except Exception as e_ml:
             log.debug(f"MoveLast() failed on '{SFDOC_SUBFORM_NAME}': {e_ml}")
 
@@ -390,6 +540,7 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
         log.warning(f"COM refresh failed (non-blocking): {e}")
 
 
+# File operations
 def wait_for_file(file: Path) -> bool:
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
@@ -448,6 +599,7 @@ def prevent_sleep() -> None:
         log.warning(f"Could not set execution state: {e}")
 
 
+# DO NOT MODIFY — clear_source_dir
 def clear_source_dir() -> None:
     items = list(SOURCE_DIR.iterdir())
     if not items:
@@ -467,8 +619,58 @@ def clear_source_dir() -> None:
     log.info("Source directory cleared.")
 
 
-#  Worker thread
-def worker(file_queue: queue.Queue) -> None:
+# Catch-up scan
+def _catchup_scan(file_queue: queue.Queue, known_files: set) -> None:
+    """
+    Recursively scans SOURCE_DIR for files missed by watchdog (network instability, restart, etc.).
+    Enqueues only files not already tracked in known_files.
+    """
+    if not SOURCE_DIR.is_dir():
+        log.warning("[CATCHUP] SOURCE_DIR not accessible, scan skipped.")
+        return
+
+    found = 0
+    try:
+        for file in SOURCE_DIR.rglob("*"):
+            if not file.is_file():
+                continue
+            if file.suffix.lower() not in WATCHED_EXTENSIONS:
+                continue
+            if file in known_files:
+                continue
+            known_files.add(file)
+            file_queue.put(file)
+            found += 1
+            log.info(f"[CATCHUP] Caught up: {file.name} (queue: {file_queue.qsize()})")
+    except Exception as e:
+        log.warning(f"[CATCHUP] Scan error: {e}")
+
+    if found:
+        log.info(f"[CATCHUP] {found} file(s) enqueued.")
+    else:
+        log.debug("[CATCHUP] No new files detected.")
+
+
+def _run_catchup(file_queue: queue.Queue, known_files: set) -> None:
+    """Periodically scans SOURCE_DIR every _CATCHUP_INTERVAL seconds."""
+    log.info(f"CatchupThread started (interval: {_CATCHUP_INTERVAL}s).")
+    while not _stop_event.is_set():
+        for _ in range(_CATCHUP_INTERVAL):
+            if _stop_event.is_set():
+                break
+            time.sleep(1)
+        if not _stop_event.is_set():
+            _catchup_scan(file_queue, known_files)
+    log.info("CatchupThread stopped.")
+
+
+# Worker (queue consumer)
+def worker(file_queue: queue.Queue, known_files: set) -> None:
+    """
+    Consumes the file queue, handles Nidek deduplication,
+    inserts records into the DB, and triggers batched UI refreshes.
+    Delegates failed inserts to enqueue_retry() to avoid data loss.
+    """
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
@@ -476,7 +678,7 @@ def worker(file_queue: queue.Queue) -> None:
 
     needs_refresh: bool      = False
     last_patient_code: str | None = None
-    burst_count: int         = 0   # files successfully inserted in the current burst
+    burst_count: int         = 0
 
     try:
         while True:
@@ -501,13 +703,13 @@ def worker(file_queue: queue.Queue) -> None:
 
             log.info(f"Processing: {file.name} ({file_queue.qsize()} pending)")
 
-            # First file of a new burst
             if burst_count == 0 and not needs_refresh:
                 _notify("Transfer in progress", file.name)
             _set_status("Transfer in progress...", processing=True)
 
             if not file.exists():
                 log.warning(f"File gone before processing: {file}")
+                known_files.discard(file)
                 file_queue.task_done()
                 continue
 
@@ -517,7 +719,7 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            # Nidek deduplication
+            # Nidek deduplication — DO NOT MODIFY
             scan_dir = file.parent
             main_dir = file.parent.parent
             is_nidek = main_dir.parent == SOURCE_DIR
@@ -535,6 +737,7 @@ def worker(file_queue: queue.Queue) -> None:
                     if not scan_dir.exists():
                         processed_scan_dirs.discard(scan_dir)
 
+                    known_files.discard(file)
                     file_queue.task_done()
                     continue
 
@@ -566,6 +769,7 @@ def worker(file_queue: queue.Queue) -> None:
                         log.info(f"[NIDEK] Thumbnail removed: {file.name}")
                     except Exception as e:
                         log.warning(f"[NIDEK] Could not remove thumbnail {file.name}: {e}")
+                    known_files.discard(file)
                     file_queue.task_done()
                     continue
 
@@ -574,8 +778,8 @@ def worker(file_queue: queue.Queue) -> None:
                     f"({file.stat().st_size:,} bytes)"
                 )
                 processed_scan_dirs.add(scan_dir)
-            # End Nidek deduplication
 
+            # Patient wait loop
             patient    = None
             start_time = time.monotonic()
             first_log  = True
@@ -603,6 +807,7 @@ def worker(file_queue: queue.Queue) -> None:
                 time.sleep(PATIENT_POLL_INTERVAL)
 
             if patient is None:
+                known_files.discard(file)
                 continue
 
             log.info(f"Patient: {patient['nom']} {patient['prenom']} (code {patient['code']})")
@@ -612,6 +817,7 @@ def worker(file_queue: queue.Queue) -> None:
                 log.error(f"Could not resolve folder for patient {patient['code']}. Orphaning.")
                 orphan_file(file)
                 _notify("Orphan file", file.name)
+                known_files.discard(file)
                 file_queue.task_done()
                 continue
 
@@ -628,12 +834,22 @@ def worker(file_queue: queue.Queue) -> None:
                 needs_refresh     = True
                 last_patient_code = patient["code"]
                 burst_count      += 1
-                log.debug("Insert OK — needs_refresh=True (refresh deferred to burst end).")
+                log.debug("Insert OK — refresh deferred to burst end.")
+                _log_medecin(
+                    f"SUCCÈS : Scan OCT ajouté au dossier de "
+                    f"{patient['nom']} {patient['prenom']} (Code: {patient['code']})."
+                )
             else:
-                log.warning("Insert failed, refresh flag unchanged.")
-                _notify("DB Error", "Insert failed — check logs")
+                log.warning("Insert failed — scheduling retry.")
+                _notify("DB Error", "Insert failed — retry scheduled")
+                _log_medecin(
+                    f"ERREUR : Impossible d'ajouter l'examen de "
+                    f"{patient['nom']} {patient['prenom']} (Code: {patient['code']}) "
+                    f"— Réseau déconnecté, nouvelle tentative en cours…"
+                )
+                enqueue_retry(patient, relative_path, description, dest_file=dest)
 
-            # Nidek cleanup after successful transfer
+            # Nidek post-transfer cleanup
             if is_nidek:
                 _try_rmdir(scan_dir)
                 _try_rmdir(main_dir)
@@ -641,6 +857,7 @@ def worker(file_queue: queue.Queue) -> None:
                     processed_scan_dirs.discard(scan_dir)
                     log.info("[NIDEK] scan_dir cleared from tracking set.")
 
+            known_files.discard(file)
             file_queue.task_done()
 
     finally:
@@ -653,11 +870,12 @@ def worker(file_queue: queue.Queue) -> None:
         pythoncom.CoUninitialize()
 
 
-#  Watchdog producer
+# Watchdog producer
 class ImageProducer(FileSystemEventHandler):
-    def __init__(self, file_queue: queue.Queue) -> None:
+    def __init__(self, file_queue: queue.Queue, known_files: set) -> None:
         super().__init__()
-        self._queue = file_queue
+        self._queue       = file_queue
+        self._known_files = known_files
 
     def on_created(self, event) -> None:
         if event.is_directory:
@@ -665,25 +883,28 @@ class ImageProducer(FileSystemEventHandler):
         file = Path(event.src_path)
         if file.suffix.lower() not in WATCHED_EXTENSIONS:
             return
+        if file in self._known_files:
+            log.debug(f"[Watchdog] Already known, skipped: {file.name}")
+            return
+        self._known_files.add(file)
         log.info(f"Enqueued: {file.name} (queue size: {self._queue.qsize() + 1})")
         self._queue.put(file)
 
 
-#  Background thread (observer + auto-reconnect loop)
-def _run_background(file_queue: queue.Queue) -> None:
+# Background thread (observer + auto-reconnect)
+def _run_background(file_queue: queue.Queue, known_files: set) -> None:
     """
-    Wraps the PollingObserver lifecycle and auto-reconnect loop.
-    Runs in a daemon thread so pystray can own the main thread.
-    Includes the Box 2 startup clear_source_dir() call.
+    Manages the PollingObserver lifecycle and auto-reconnect loop.
+    Runs as a daemon thread so pystray can own the main thread.
+    Clears the source directory before the observer starts.
     """
     _RECONNECT_WAIT = 15
 
-    # Box 2: clear leftover files before the observer starts watching.
     clear_source_dir()
 
     def _start_observer() -> Observer:
         obs = Observer()
-        obs.schedule(ImageProducer(file_queue), str(SOURCE_DIR), recursive=True)
+        obs.schedule(ImageProducer(file_queue, known_files), str(SOURCE_DIR), recursive=True)
         obs.start()
         log.info("Observer started — watching for images.")
         return obs
@@ -694,7 +915,7 @@ def _run_background(file_queue: queue.Queue) -> None:
     try:
         while not _stop_event.is_set():
             if not observer.is_alive():
-                log.warning("Observer has stopped (network drop?). Attempting reconnect...")
+                log.warning("Observer stopped (network drop?). Attempting reconnect...")
                 _set_status(f"{BOX_NAME} — Reconnecting...", processing=False)
                 try:
                     observer.stop()
@@ -720,17 +941,17 @@ def _run_background(file_queue: queue.Queue) -> None:
         if _icon is not None:
             _icon.stop()
 
+
+# Entry point
 def main() -> None:
     global _icon, _mutex_handle
 
-    # Single-instance guard: only one instance may run at a time.
-    # If a previous instance is already active, exit silently.
+    # Single-instance guard
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_Box2_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 
-    # Manual-relaunch guard: if the parent is explorer.exe (double-click)
-    # and Studio Vision is already running, block the launch and notify.
+    # Block manual double-click restart while Studio Vision is running
     try:
         parent_name = psutil.Process(os.getpid()).parent().name().lower()
     except Exception:
@@ -746,7 +967,7 @@ def main() -> None:
                 0,
                 "To restart the image router, please fully close and relaunch Studio Vision.",
                 "Image Router",
-                0x30,  # MB_ICONWARNING | MB_OK
+                0x30,
             )
             sys.exit(0)
 
@@ -759,24 +980,38 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Version 4 started")
+    log.info("Version 5 started")
     log.info(f"  Source     : {SOURCE_DIR}")
     log.info(f"  Dest       : {DEST_PHOTOS}")
     log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
     log.info(f"  DOCUM.MDB  : {DOCUM_MDB}")
     log.info(f"  Orphans    : {ORPHAN_DIR}")
     log.info(f"  Log file   : {_LOG_FILE}")
+    log.info(f"  Doctor log : {_get_medecin_log_path()}")
     log.info(f"  Timeout    : {PATIENT_WAIT_TIMEOUT // 60} min")
     log.info(f"  Ext        : {', '.join(sorted(WATCHED_EXTENSIONS))}")
+    log.info(f"  Catchup    : every {_CATCHUP_INTERVAL}s")
+    log.info(f"  Retry      : {len(_RETRY_DELAYS)} attempts max, delays {_RETRY_DELAYS}s")
+
+    # Shared set between Watchdog, Worker, and CatchupThread to avoid duplicates
+    known_files: set = set()
 
     file_queue: queue.Queue = queue.Queue()
 
     threading.Thread(
-        target=worker, args=(file_queue,), name="Worker", daemon=True
+        target=worker, args=(file_queue, known_files), name="Worker", daemon=True
     ).start()
 
     threading.Thread(
-        target=_run_background, args=(file_queue,), name="Background", daemon=True
+        target=_run_background, args=(file_queue, known_files), name="Background", daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_run_catchup, args=(file_queue, known_files), name="CatchupThread", daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_retry_worker, name="RetryWorker", daemon=True
     ).start()
 
     if not TRAY_AVAILABLE:
@@ -813,6 +1048,7 @@ def main() -> None:
 
     _stop_event.set()
     log.info("Application stopped.")
+
 
 if __name__ == "__main__":
     main()

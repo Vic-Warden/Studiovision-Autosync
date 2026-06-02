@@ -690,12 +690,8 @@ def _get_msaccess_pids() -> set[int]:
 
 def _launch_studio_vision() -> None:
     """
-    Launches Studio Vision and monitors all msaccess.exe processes.
-
-    msaccess.exe /runtime is a two-stage launcher: the initial PID exits after
-    ~3 s and hands off to a new worker PID. Tracking the full process set (not
-    a single PID) ensures the router stays alive through that transition.
-    Sets _stop_event when all msaccess.exe processes have exited.
+    Launches Studio Vision and monitors strictly its own msaccess.exe processes.
+    Forces termination of zombie processes on exit to release COM locks.
     """
     log.info(f"Launching Studio Vision: {' '.join(STUDIO_VISION_CMD)}")
 
@@ -704,7 +700,7 @@ def _launch_studio_vision() -> None:
     try:
         subprocess.Popen(STUDIO_VISION_CMD)
     except FileNotFoundError:
-        log.critical(f"Studio Vision executable not found: {STUDIO_VISION_CMD[0]}. Shutting down.")
+        log.critical(f"Studio Vision executable not found. Shutting down.")
         _stop_event.set()
         return
     except Exception as exc:
@@ -714,39 +710,51 @@ def _launch_studio_vision() -> None:
 
     log.info(f"Waiting up to {_SV_STARTUP_TIMEOUT}s for msaccess.exe to start...")
     deadline = time.monotonic() + _SV_STARTUP_TIMEOUT
+    tracked_pids: set[int] = set()
 
     while time.monotonic() < deadline and not _stop_event.is_set():
         new_pids = _get_msaccess_pids() - pids_before
         if new_pids:
-            log.info(f"Studio Vision running (msaccess.exe PIDs: {sorted(new_pids)}).")
+            tracked_pids = new_pids
+            log.info(f"Studio Vision running (PIDs: {sorted(tracked_pids)}).")
             break
         time.sleep(1)
     else:
         if not _stop_event.is_set():
-            log.error("msaccess.exe did not appear within the startup timeout. Shutting down.")
+            log.error("msaccess.exe did not appear. Shutting down.")
             _stop_event.set()
         return
 
     consecutive_empty = 0
-    _EMPTY_THRESHOLD  = 2  # Consecutive empty polls required before declaring shutdown
+    _EMPTY_THRESHOLD  = 2
 
     try:
         while not _stop_event.is_set():
             time.sleep(_SV_POLL_INTERVAL)
-            current_pids = _get_msaccess_pids()
-            if not current_pids:
+            # 1. On vérifie UNIQUEMENT les PIDs que ce script a lancé, pas les autres
+            alive_pids = {pid for pid in tracked_pids if psutil.pid_exists(pid)}
+
+            if not alive_pids:
                 consecutive_empty += 1
-                log.debug(f"No msaccess.exe found ({consecutive_empty}/{_EMPTY_THRESHOLD}).")
+                log.debug(f"Tracked msaccess.exe missing ({consecutive_empty}/{_EMPTY_THRESHOLD}).")
                 if consecutive_empty >= _EMPTY_THRESHOLD:
-                    log.info("All msaccess.exe processes have exited. Initiating shutdown.")
+                    log.info("Studio Vision closed by user. Initiating shutdown.")
                     break
             else:
-                if consecutive_empty:
-                    log.debug(f"msaccess.exe reappeared (PIDs: {sorted(current_pids)}).")
                 consecutive_empty = 0
+                
     except Exception as exc:
         log.error(f"Error while monitoring msaccess.exe: {exc}")
     finally:
+        for pid in tracked_pids:
+            try:
+                p = psutil.Process(pid)
+                if p.is_running():
+                    p.kill()
+                    log.info(f"Force-killed zombie msaccess.exe (PID {pid}) to release COM locks.")
+            except Exception:
+                pass
+
         _stop_event.set()
         if _icon is not None:
             try:

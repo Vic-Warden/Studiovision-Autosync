@@ -55,6 +55,7 @@ SOURCE_DIR  = Path(r"??")  # Acquisition drop folder
 ORPHAN_DIR  = Path(r"??")  # Unmatched files destination
 DEST_PHOTOS = Path(r"??")  # Network photo archive root
 
+# Studio Vision launch command (exact sequence required by the application)
 STUDIO_VISION_CMD = [
     r"C:\Studiov2000-OM\svprog\msaccess.exe",
     "/runtime",
@@ -67,6 +68,7 @@ STUDIO_VISION_CMD = [
     "demarrage",
 ]
 
+# File extensions to watch
 WATCHED_EXTENSIONS: set[str] = {
     ".jpg", ".jpeg", ".jfif",
     ".png", ".bmp",
@@ -76,28 +78,36 @@ WATCHED_EXTENSIONS: set[str] = {
 }
 
 EXAM_DESCRIPTION: dict[str, str] = {
-    ".jpg":  "Image", ".jpeg": "Image", ".jfif": "Image",
-    ".png":  "Image", ".bmp":  "Image",
-    ".tif":  "OCT",   ".tiff": "OCT",
+    ".jpg":  "Image",
+    ".jpeg": "Image",
+    ".jfif": "Image",
+    ".png":  "Image",
+    ".bmp":  "Image",
+    ".tif":  "OCT",
+    ".tiff": "OCT",
     ".dcm":  "DICOM",
-    ".pdf":  "Document", ".rtf": "Document",
-    ".doc":  "Document", ".docx": "Document", ".odt": "Document",
+    ".pdf":  "Document",
+    ".rtf":  "Document",
+    ".doc":  "Document",
+    ".docx": "Document",
+    ".odt":  "Document",
 }
 
 # Timing constants
-FILE_LOCK_RETRY_DELAY:  int = 3
-FILE_LOCK_MAX_ATTEMPTS: int = 15
-PATIENT_POLL_INTERVAL:  int = 3
-PATIENT_WAIT_TIMEOUT:   int = 900
-CATCHUP_INTERVAL:       int = 120
+FILE_LOCK_RETRY_DELAY:  int = 3    # seconds between file-lock retries
+FILE_LOCK_MAX_ATTEMPTS: int = 15   # max file-lock retry attempts
+PATIENT_POLL_INTERVAL:  int = 3    # seconds between patient-open checks
+PATIENT_WAIT_TIMEOUT:   int = 900  # seconds before orphaning a file
+CATCHUP_INTERVAL:       int = 120  # seconds between periodic source-dir scans
 
 # Access COM field names — must match the Access form exactly
 ACCESS_FIELD_CODE   = "Code patient"
 ACCESS_FIELD_NOM    = "NOM"
 ACCESS_FIELD_PRENOM = "Prénom"
 
-SFDOC_SUBFORM_NAME   = "SFDoc"
-_AC_SUBFORM          = 112  # Access control-type constant for subforms
+SFDOC_SUBFORM_NAME = "SFDoc"
+_AC_SUBFORM        = 112   # Access control-type constant for subforms
+
 _GUI_PRE_INSERT_DELAY = 0.3  # Seconds between file move and GUI insert
 _UI_POST_INSERT_DELAY = 0.5  # Seconds between insert and Requery/MoveLast
 
@@ -128,9 +138,10 @@ def _get_doctor_log_path() -> Path:
 def log_doctor(message: str) -> None:
     """Appends a timestamped line to the daily doctor report."""
     timestamp = datetime.now().strftime("%H:%M")
+    line = f"[{timestamp}] {message}\n"
     try:
         with open(_get_doctor_log_path(), "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {message}\n")
+            f.write(line)
     except Exception as exc:
         log.warning(f"Could not write to doctor report: {exc}")
 
@@ -154,7 +165,10 @@ def _make_icon(color: tuple) -> "Image.Image":
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     margin = 4
-    draw.ellipse([margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin], fill=color)
+    draw.ellipse(
+        [margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin],
+        fill=color,
+    )
     return img
 
 
@@ -200,14 +214,17 @@ def _quit(icon, item) -> None:  # noqa: ARG001
 # Network share availability
 
 def wait_for_network_share() -> None:
-    """Blocks until SOURCE_DIR is reachable. No-op for local paths."""
+    """Blocks until SOURCE_DIR is reachable (no-op for local paths)."""
     is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
     if not is_network:
         return
     attempt = 0
     while not SOURCE_DIR.is_dir():
         attempt += 1
-        log.warning(f"Network share not reachable: {SOURCE_DIR} (attempt {attempt}, retrying in {_NETWORK_SHARE_POLL}s)")
+        log.warning(
+            f"Network share not reachable: {SOURCE_DIR}  "
+            f"(attempt {attempt}, retrying in {_NETWORK_SHARE_POLL}s)"
+        )
         time.sleep(_NETWORK_SHARE_POLL)
     if attempt:
         log.info(f"Network share accessible after {attempt} attempt(s): {SOURCE_DIR}")
@@ -221,16 +238,22 @@ def build_patient_relative_path(patient_code: str, last_name: str, first_name: s
     Format: [First 2 digits].000\\[Full code][last3].[first3]
     Example: code=1758511228, last=ABCDEF, first=DEFGH → "17.000\\1758511228abc.def"
     """
-    prefix  = patient_code[:2]
+    prefix = patient_code[:2]
     last_3  = last_name[:3].lower()
     first_3 = first_name[:3].lower()
-    return f"{prefix}.000\\{patient_code}{last_3}.{first_3}"
+    top_folder  = f"{prefix}.000"
+    sub_folder  = f"{patient_code}{last_3}.{first_3}"
+    return f"{top_folder}\\{sub_folder}"
 
 
 def resolve_patient_folder(patient: dict) -> Path | None:
     """Resolves and creates the patient folder on disk. Returns None on failure."""
     try:
-        rel    = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
+        rel = build_patient_relative_path(
+            patient["code"],
+            patient["nom"],
+            patient["prenom"],
+        )
         folder = DEST_PHOTOS / rel
         folder.mkdir(parents=True, exist_ok=True)
         log.info(f"Patient folder resolved: {folder}")
@@ -317,47 +340,57 @@ def gui_insert_document(patient: dict, relative_path: str) -> bool:
         if not current or current["code"] != patient["code"]:
             log.warning(
                 f"GUI insert aborted: patient changed "
-                f"(expected={patient['code']}, current={current['code'] if current else 'none'})."
+                f"(expected={patient['code']}, "
+                f"current={current['code'] if current else 'none'})."
             )
             return False
 
         sfdoc = _find_sfdoc(form)
         if sfdoc is None:
-            log.error(f"Subform '{SFDOC_SUBFORM_NAME}' not found — GUI insertion aborted.")
+            log.error(
+                f"Subform '{SFDOC_SUBFORM_NAME}' not found — GUI insertion aborted."
+            )
             return False
 
         sfdoc.Recordset.AddNew()
-        log.debug("AddNew() called on SFDoc recordset.")
 
+        # Write the relative path into all relevant fields
         try:
             sfdoc.Recordset.Fields("Photo externe").Value = relative_path
         except Exception:
             pass
+
         try:
             sfdoc.Recordset.Fields("TEXTE").Value = relative_path
         except Exception:
             pass
+
         try:
             sfdoc.Recordset.Fields("Date").Value = datetime.now()
         except Exception:
             pass
 
+        # Commit the record
         sfdoc.Recordset.Update()
-        log.info(f"GUI insert OK: patient={patient['code']} path='{relative_path}'")
+        log.info(
+            f"GUI insert OK: patient={patient['code']} path='{relative_path}'"
+        )
 
         time.sleep(_UI_POST_INSERT_DELAY)
 
+        # Requery the subform so the new record appears
         try:
             sfdoc.Requery()
             log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}'.")
         except Exception as exc:
-            log.warning(f"Requery() failed: {exc}")
+            log.warning(f"Requery() failed on '{SFDOC_SUBFORM_NAME}': {exc}")
             try:
                 sfdoc.Refresh()
                 log.info(f"Fallback Refresh() on '{SFDOC_SUBFORM_NAME}'.")
             except Exception as exc2:
                 log.warning(f"Fallback Refresh() also failed: {exc2}")
 
+        # Scroll to the newly inserted record
         try:
             sfdoc.Recordset.MoveLast()
             log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}' — new record visible.")
@@ -413,7 +446,10 @@ def orphan_file(file: Path) -> None:
 def prevent_sleep() -> None:
     """Prevents Windows from sleeping while the router is active."""
     try:
-        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 |  # ES_CONTINUOUS
+            0x00000001    # ES_SYSTEM_REQUIRED
+        )
         log.info("Sleep prevention active.")
     except Exception as exc:
         log.warning(f"Could not set execution state: {exc}")
@@ -443,11 +479,11 @@ def _scan_source_for_missed_files(file_queue: queue.Queue) -> None:
     log.info(f"Catchup scan: {len(found)} file(s) found — enqueuing.")
     for f in found:
         file_queue.put(f)
-        log.info(f"  Catchup enqueued: {f.name}")
+        log.info(f"  Catchup → enqueued: {f.name}")
 
 
 def _catchup_loop(file_queue: queue.Queue) -> None:
-    """Periodically re-scans SOURCE_DIR to catch files missed by the observer."""
+    """Periodically re-scans SOURCE_DIR to catch any files missed by the observer."""
     log.info(f"Catchup thread started (interval: {CATCHUP_INTERVAL}s).")
     while not _stop_event.is_set():
         for _ in range(CATCHUP_INTERVAL):
@@ -475,9 +511,9 @@ def worker(file_queue: queue.Queue) -> None:
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    needs_refresh:     bool       = False
-    last_patient_code: str | None = None
-    burst_count:       int        = 0
+    needs_refresh:     bool           = False
+    last_patient_code: str | None     = None
+    burst_count:       int            = 0
 
     try:
         while True:
@@ -503,11 +539,13 @@ def worker(file_queue: queue.Queue) -> None:
                 _notify("Transfer in progress", file.name)
             _set_status("Transfer in progress...", processing=True)
 
+            # Guard: file must still exist
             if not file.exists():
                 log.warning(f"File gone before processing: {file}")
                 file_queue.task_done()
                 continue
 
+            # Wait for the file to be fully written / unlocked
             if not wait_for_file(file):
                 log.error(f"Aborting — persistent file lock: {file.name}")
                 _notify("Error", f"File locked: {file.name}")
@@ -528,13 +566,19 @@ def worker(file_queue: queue.Queue) -> None:
                 if elapsed >= PATIENT_WAIT_TIMEOUT:
                     orphan_file(file)
                     _notify("Orphan file", file.name)
-                    log_doctor(f"WARNING: File '{file.name}' orphaned (no patient open after {PATIENT_WAIT_TIMEOUT // 60} min).")
+                    log_doctor(
+                        f"WARNING: File '{file.name}' orphaned "
+                        f"(no patient open after {PATIENT_WAIT_TIMEOUT // 60} min)."
+                    )
                     file_queue.task_done()
                     patient = None
                     break
 
                 if first_log:
-                    log.info(f"No patient open — waiting (timeout in {PATIENT_WAIT_TIMEOUT // 60} min)")
+                    log.info(
+                        f"No patient open — waiting "
+                        f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
+                    )
                     first_log = False
 
                 time.sleep(PATIENT_POLL_INTERVAL)
@@ -542,15 +586,25 @@ def worker(file_queue: queue.Queue) -> None:
             if patient is None:
                 continue
 
-            log.info(f"Patient: {patient['nom']} {patient['prenom']} (code {patient['code']})")
+            log.info(
+                f"Patient: {patient['nom']} {patient['prenom']} "
+                f"(code {patient['code']})"
+            )
 
             # Resolve the patient folder
             patient_folder = resolve_patient_folder(patient)
             if not patient_folder:
-                log.error(f"Could not resolve folder for patient {patient['code']}. Orphaning.")
+                log.error(
+                    f"Could not resolve folder for patient {patient['code']}. "
+                    "Orphaning."
+                )
                 orphan_file(file)
                 _notify("Orphan file", file.name)
-                log_doctor(f"ERROR: Folder could not be created for '{file.name}' (patient {patient['nom']} {patient['prenom']}, code {patient['code']}).")
+                log_doctor(
+                    f"ERROR: Folder could not be created for '{file.name}' "
+                    f"(patient {patient['nom']} {patient['prenom']}, "
+                    f"code {patient['code']})."
+                )
                 file_queue.task_done()
                 continue
 
@@ -560,22 +614,46 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            rel_path      = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
+            rel_path = build_patient_relative_path(
+                patient["code"], patient["nom"], patient["prenom"]
+            )
             relative_path = f"\\{rel_path}\\{dest.name}"
 
+            description = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
+
+            # Brief pause then insert into SFDoc via GUI
             time.sleep(_GUI_PRE_INSERT_DELAY)
 
             if gui_insert_document(patient, relative_path):
                 needs_refresh     = True
                 last_patient_code = patient["code"]
                 burst_count      += 1
-                log.info(f"Record inserted into SFDoc: '{dest.name}' → {relative_path}")
-                log_doctor(f"SUCCESS: '{dest.name}' added to the record of {patient['nom']} {patient['prenom']} (code {patient['code']}).")
+                log.info(
+                    f"Record inserted into SFDoc: '{dest.name}' "
+                    f"→ {relative_path}"
+                )
+                log_doctor(
+                    f"SUCCESS: '{dest.name}' added to the record of "
+                    f"{patient['nom']} {patient['prenom']} "
+                    f"(code {patient['code']})."
+                )
             else:
                 # File already moved — log clearly for manual reconciliation
-                log.error(f"GUI insertion FAILED for '{dest.name}' (patient {patient['code']}). File at: {dest}. Manual entry required.")
-                _notify("Insert error", f"'{dest.name}' moved but not inserted — see log.")
-                log_doctor(f"ERROR: '{dest.name}' was moved to {dest} but could NOT be inserted for patient {patient['nom']} {patient['prenom']} (code {patient['code']}). Manual entry required.")
+                log.error(
+                    f"GUI insertion FAILED for '{dest.name}' "
+                    f"(patient {patient['code']}). "
+                    f"File is at: {dest}. Manual record entry required."
+                )
+                _notify(
+                    "Insert error",
+                    f"'{dest.name}' moved but not inserted — see log.",
+                )
+                log_doctor(
+                    f"ERROR: '{dest.name}' was moved to {dest} but could NOT "
+                    f"be inserted into the Access form for patient "
+                    f"{patient['nom']} {patient['prenom']} "
+                    f"(code {patient['code']}). Manual entry required."
+                )
 
             file_queue.task_done()
 
@@ -650,24 +728,45 @@ def _run_background(file_queue: queue.Queue) -> None:
 
 # Studio Vision lifecycle wrapper
 
-# msaccess.exe /runtime spawns the real Access window in a separate process and
-# exits immediately — subprocess.run() would return after ~2 s, causing premature
-# shutdown. Instead, we Popen the command and watch the real msaccess.exe PID.
-_SV_POLL_INTERVAL    = 3
-_SV_STARTUP_TIMEOUT  = 30
+# msaccess.exe /runtime spawns the real Access window in a new process and exits
+# immediately — we Popen the command and watch the real msaccess.exe PID set instead.
+_SV_POLL_INTERVAL   = 3
+_SV_STARTUP_TIMEOUT = 30
+
+
+def _get_msaccess_pids() -> set[int]:
+    """Returns the set of all currently running msaccess.exe PIDs."""
+    pids: set[int] = set()
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if (proc.info["name"] or "").lower() == "msaccess.exe":
+                pids.add(proc.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return pids
 
 
 def _launch_studio_vision() -> None:
     """
-    Launches Studio Vision then polls msaccess.exe until it exits.
+    Launches Studio Vision then polls the msaccess.exe process set until it empties.
     Sets _stop_event on exit or failure.
+
+    msaccess.exe /runtime is a two-stage launcher: the initial PID exits after ~3s
+    while a new PID hosts the actual window. We track ALL msaccess.exe PIDs, not
+    a single one, to survive that transition.
     """
     log.info(f"Launching Studio Vision: {' '.join(STUDIO_VISION_CMD)}")
+
+    # Snapshot PIDs already running before our launch (edge case: Access open for another reason)
+    pids_before: set[int] = _get_msaccess_pids()
 
     try:
         subprocess.Popen(STUDIO_VISION_CMD)
     except FileNotFoundError:
-        log.critical(f"Studio Vision executable not found: {STUDIO_VISION_CMD[0]}. Shutting down.")
+        log.critical(
+            f"Studio Vision executable not found: {STUDIO_VISION_CMD[0]}. "
+            "Shutting down."
+        )
         _stop_event.set()
         return
     except Exception as exc:
@@ -675,40 +774,51 @@ def _launch_studio_vision() -> None:
         _stop_event.set()
         return
 
-    # Wait for msaccess.exe to appear in the process list
+    # Wait for at least one new msaccess.exe PID to appear
     log.info(f"Waiting up to {_SV_STARTUP_TIMEOUT}s for msaccess.exe to start...")
-    sv_pid: int | None = None
     deadline = time.monotonic() + _SV_STARTUP_TIMEOUT
 
     while time.monotonic() < deadline and not _stop_event.is_set():
-        for proc in psutil.process_iter(["pid", "name"]):
-            try:
-                if (proc.info["name"] or "").lower() == "msaccess.exe":
-                    sv_pid = proc.info["pid"]
-                    break
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        if sv_pid is not None:
+        new_pids = _get_msaccess_pids() - pids_before
+        if new_pids:
+            log.info(
+                f"Studio Vision running "
+                f"(msaccess.exe PIDs: {sorted(new_pids)})."
+            )
             break
         time.sleep(1)
-
-    if sv_pid is None:
-        log.error("msaccess.exe did not appear within the startup timeout. Shutting down.")
-        _stop_event.set()
+    else:
+        if not _stop_event.is_set():
+            log.error(
+                "msaccess.exe did not appear within the startup timeout. "
+                "Shutting down."
+            )
+            _stop_event.set()
         return
 
-    log.info(f"Studio Vision running (msaccess.exe PID={sv_pid}).")
+    # Poll: Studio Vision is alive as long as any msaccess.exe is running.
+    # Require 2 consecutive empty polls before declaring shutdown, to survive
+    # the brief gap between loader exit and worker process start.
+    consecutive_empty  = 0
+    _EMPTY_THRESHOLD   = 2
 
-    # Poll until the process exits
     try:
-        sv_proc = psutil.Process(sv_pid)
         while not _stop_event.is_set():
-            if not sv_proc.is_running() or sv_proc.status() == psutil.STATUS_ZOMBIE:
-                log.info(f"msaccess.exe (PID={sv_pid}) has exited. Initiating shutdown.")
-                break
             time.sleep(_SV_POLL_INTERVAL)
-    except psutil.NoSuchProcess:
-        log.info(f"msaccess.exe (PID={sv_pid}) disappeared. Initiating shutdown.")
+            current_pids = _get_msaccess_pids()
+            if not current_pids:
+                consecutive_empty += 1
+                log.debug(
+                    f"No msaccess.exe found "
+                    f"({consecutive_empty}/{_EMPTY_THRESHOLD})."
+                )
+                if consecutive_empty >= _EMPTY_THRESHOLD:
+                        log.info("All msaccess.exe processes exited. Initiating shutdown.")
+                        break
+            else:
+                if consecutive_empty:
+                    log.debug(f"msaccess.exe reappeared (PIDs: {sorted(current_pids)}). Continuing.")
+                consecutive_empty = 0
     except Exception as exc:
         log.error(f"Error while monitoring msaccess.exe: {exc}")
     finally:
@@ -725,7 +835,8 @@ def _launch_studio_vision() -> None:
 def main() -> None:
     global _icon, _mutex_handle
 
-    # Single-instance guard
+    # Single-instance guard — stale mutex may remain after a crash;
+    # check for a live router process before refusing startup.
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         router_alive = any(
@@ -753,7 +864,8 @@ def main() -> None:
         if sv_running:
             ctypes.windll.user32.MessageBoxW(
                 0,
-                "To restart the image router, please close Studio Vision completely and relaunch it.",
+                "To restart the image router, please close Studio Vision "
+                "completely and relaunch it.",
                 "Image Router",
                 0x30,  # MB_ICONWARNING | MB_OK
             )
@@ -813,14 +925,23 @@ def main() -> None:
         return
 
     menu = pystray.Menu(
-        pystray.MenuItem(text=lambda item: _status_text, action=None, enabled=False),
+        pystray.MenuItem(
+            text=lambda item: _status_text,
+            action=None,
+            enabled=False,
+        ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Open technical log", _open_log_file),
-        pystray.MenuItem("Open doctor report", _open_doctor_log),
-        pystray.MenuItem("Quit",               _quit),
+        pystray.MenuItem("Open technical log",  _open_log_file),
+        pystray.MenuItem("Open doctor report",  _open_doctor_log),
+        pystray.MenuItem("Quit",                _quit),
     )
 
-    _icon = pystray.Icon(name=BOX_NAME, icon=_make_icon(_COLOR_READY), title=BOX_NAME, menu=menu)
+    _icon = pystray.Icon(
+        name=BOX_NAME,
+        icon=_make_icon(_COLOR_READY),
+        title=BOX_NAME,
+        menu=menu,
+    )
 
     log.info("System tray icon started.")
     _icon.run()  # Blocks until _icon.stop() is called

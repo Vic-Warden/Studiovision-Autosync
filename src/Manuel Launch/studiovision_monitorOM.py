@@ -1,112 +1,93 @@
 """
-Routes incoming imaging files to the correct patient folder,
-inserts a DB record, and refreshes the Access UI.
+Studio Vision OM Monitor — Version 6.0
 
-Pipeline: PollingObserver -> file_queue -> Worker -> Access DB + UI refresh
-          (1.5s burst debounce, auto-reconnect on network drop)
+Routes incoming imaging files to the correct patient folder and inserts
+the record directly into the active Access form via win32com GUI automation.
+The pyodbc/SQL layer has been completely removed.
 
-New in v5:
-  - Startup scan + independent catchup loop
-  - Progressive retry queue on DB failure
-  - Smart post-commit delay before Requery/MoveLast
-  - Simplified doctor log in French (rapport_medecin_YYYY-MM-DD.txt)
+Pipeline:
+  PollingObserver → file_queue → Worker → shutil.move + COM insert + UI refresh
 
-Fixed in v5.1:
-  - TRAY_AVAILABLE now correctly set to True on successful pystray import
-  - ImageProducer: added on_modified handler + deduplication seen-set
-  - _scan_source_for_missed_files: replaced rglob with flat iterdir
-  - worker: orphan timeout path wrapped in try/finally to guarantee task_done()
-  - _run_background: observer scheduled with recursive=False (staging folder is flat)
+Handles the /runtime 2-stage relay: _launch_studio_vision() tracks msaccess.exe
+across the launcher-then-real-process handoff and force-kills zombie COM locks on exit.
 
-Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
+Logging:
+  Technical log : ~/studiovision/image_router_OM.log
+  Doctor report : ~/studiovision/rapport_medecin_YYYY-MM-DD.txt (French)
+
+Dependencies: watchdog, pywin32, pythoncom, pystray, Pillow, psutil
 """
 
+import ctypes
+import logging
 import os
 import pythoncom
 import queue
 import shutil
+import subprocess
 import sys
 import threading
 import time
-import ctypes
-import logging
-import subprocess
+import win32api
+import win32com.client
+import win32event
+import winerror
+import psutil
 from datetime import datetime
 from pathlib import Path
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
 
 try:
-    import win32com.client
-    WIN32_AVAILABLE = True
-except ImportError:
-    WIN32_AVAILABLE = False
-
-try:
-    import pyodbc
-    PYODBC_AVAILABLE = True
-except ImportError:
-    PYODBC_AVAILABLE = False
-
-try:
     import pystray
     from PIL import Image, ImageDraw
-    TRAY_AVAILABLE = True   # Correctly reflects successful import
+    TRAY_AVAILABLE = True
 except ImportError:
     TRAY_AVAILABLE = False
 
-import win32api
-import win32event
-import winerror
-import psutil
-
 # Configuration
-BOX_NAME          = "Studiovision"
-STUDIO_VISION_EXE = "studiovision.exe"
+BOX_NAME = "Studiovision OM"
 
-SOURCE_DIR  = Path(r"C:\Users\Box-6\Desktop\OM")
-ORPHAN_DIR  = Path(r"C:\Users\Box-6\Desktop\Images_Oubliées")
-DEST_PHOTOS = Path(r"\\studiovision\Studiov2000-OM\PHOTOS")
-PUBLIC_MDB  = Path(r"\\studiovision\Studiov2000-OM\PUBLIC.MDB")
-DOCUM_MDB   = Path(r"\\studiovision\Studiov2000-OM\DOCUM.MDB")
+SOURCE_DIR    = Path(r"C:\Users\Box-6\Desktop\OM")                  # Acquisition drop folder
+ORPHAN_DIR    = Path(r"C:\Users\Box-6\Desktop\Images_Oubliées")     # Unassignable file quarantine
+DEST_PHOTOS   = Path(r"\\studiovision\Studiov2000-OM\PHOTOS")        # Root of the patient photo tree
+TRIAGE_SCRIPT = r"C:\Chemin\Vers\Ton\Dossier\studiovision_export.py"  # Dispatcher script
 
-WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt"}
-FILE_LOCK_RETRY_DELAY  = 3
-FILE_LOCK_MAX_ATTEMPTS = 15
-PATIENT_POLL_INTERVAL  = 3
-PATIENT_WAIT_TIMEOUT   = 900
+STUDIO_VISION_CMD = [
+    r"C:\Studiov2000\Svprog\MSACCESS.EXE",
+    "/runtime", r"C:\Studiov2000-OM\svprog\Ophprog.mde",
+    "/wrkgrp",  r"C:\Studiov2000-OM\config\system.mdw",
+    "/User", "/Pwd", "/X", "demarrage",
+]
+
+WATCHED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".jfif", ".png", ".bmp",
+    ".tif", ".tiff", ".dcm", ".pdf",
+    ".rtf", ".doc", ".docx", ".odt",
+}
+
+EXAM_DESCRIPTION = {ext: "Champ visuel" for ext in WATCHED_EXTENSIONS}
 
 ACCESS_FIELD_CODE   = "Code patient"
 ACCESS_FIELD_NOM    = "NOM"
 ACCESS_FIELD_PRENOM = "Prénom"
 
 SFDOC_SUBFORM_NAME = "SFDoc"
+_AC_SUBFORM        = 112  # Access ControlType constant for subform
 
-EXAM_DESCRIPTION = {
-    ".jpg":  "Champ visuel",
-    ".jpeg": "Champ visuel",
-    ".jfif": "Champ visuel",
-    ".png":  "Champ visuel",
-    ".bmp":  "Champ visuel",
-    ".tif":  "Champ visuel",
-    ".tiff": "Champ visuel",
-    ".dcm":  "Champ visuel",
-    ".pdf":  "Champ visuel",
-    ".rtf":  "Champ visuel",
-    ".doc":  "Champ visuel",
-    ".docx": "Champ visuel",
-    ".odt":  "Champ visuel",
-}
+FILE_LOCK_RETRY_DELAY  = 3    # Seconds between lock-check attempts
+FILE_LOCK_MAX_ATTEMPTS = 15
+PATIENT_POLL_INTERVAL  = 3    # Seconds between "is a patient open?" polls
+PATIENT_WAIT_TIMEOUT   = 900  # Seconds before orphaning (15 min)
+CATCHUP_INTERVAL       = 120  # Seconds between periodic source-dir scans
 
-# Progressive retry delays (seconds) between DB insert attempts
-RETRY_DELAYS = [10, 30, 60, 120, 300]
-# Interval (seconds) between catchup scans of the source folder
-CATCHUP_INTERVAL = 120
+_SV_POLL_INTERVAL   = 3   # Seconds between msaccess.exe alive checks
+_SV_STARTUP_TIMEOUT = 30  # Seconds to wait for msaccess.exe to appear after launch
 
 # Logging
-_LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
+_LOG_DIR = Path(os.path.expanduser("~")) / "studiovision"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
-_LOG_FILE = _LOG_DIR / "image_router.log"
+_LOG_FILE = _LOG_DIR / "image_router_OM.log"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,49 +98,41 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger("image_router")
+log = logging.getLogger("image_router_OM")
 
 
-# Doctor log (simplified, in French)
 def _get_medecin_log_path() -> Path:
-    """Returns the path to today's doctor report."""
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    return _LOG_DIR / f"rapport_medecin_{date_str}.txt"
+    return _LOG_DIR / f"rapport_medecin_{datetime.now().strftime('%Y-%m-%d')}.txt"
 
 
 def log_medecin(message: str) -> None:
-    """Appends a timestamped line to the daily doctor report."""
-    heure = datetime.now().strftime("%Hh%M")
-    ligne = f"[{heure}] {message}\n"
+    """Appends a timestamped line to the daily doctor report (French)."""
     try:
-        with open(_get_medecin_log_path(), "a", encoding="utf-8") as f:
-            f.write(ligne)
-    except Exception as e:
-        log.warning(f"Could not write to doctor report: {e}")
+        with open(_get_medecin_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now().strftime('%Hh%M')}] {message}\n")
+    except Exception as exc:
+        log.warning(f"Could not write to doctor report: {exc}")
 
 
-# System tray
-_NETWORK_SHARE_POLL = 10
+# Global state
+_icon:         "pystray.Icon | None" = None
+_status_text:  str                   = "Starting..."
+_stop_event:   threading.Event       = threading.Event()
+_mutex_handle                        = None
 
 _ICON_SIZE    = 64
 _COLOR_READY  = (30, 144, 255)
 _COLOR_ACTIVE = (50, 205, 50)
 
-_icon: "pystray.Icon | None" = None
-_status_text: str             = "Starting..."
-_stop_event: threading.Event  = threading.Event()
 
-_mutex_handle = None
+# System tray helpers
 
 
 def _make_icon(color: tuple) -> "Image.Image":
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    margin = 4
-    draw.ellipse(
-        [margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin],
-        fill=color,
-    )
+    m    = 4
+    draw.ellipse([m, m, _ICON_SIZE - m, _ICON_SIZE - m], fill=color)
     return img
 
 
@@ -170,30 +143,30 @@ def _set_status(text: str, processing: bool = False) -> None:
         try:
             _icon.icon = _make_icon(_COLOR_ACTIVE if processing else _COLOR_READY)
             _icon.update_menu()
-        except Exception as e:
-            log.debug(f"Tray update failed: {e}")
+        except Exception as exc:
+            log.debug(f"Tray update failed: {exc}")
 
 
 def _notify(title: str, message: str = "") -> None:
     if _icon is not None:
         try:
-            _icon.notify(message if message else title, title)
-        except Exception as e:
-            log.debug(f"Notification failed: {e}")
+            _icon.notify(message or title, title)
+        except Exception as exc:
+            log.debug(f"Notification failed: {exc}")
 
 
-def _open_logs(icon, item) -> None:  # noqa: ARG001
+def _open_logs(icon, item) -> None:      # noqa: ARG001
     try:
         os.startfile(str(_LOG_FILE))
-    except Exception as e:
-        log.warning(f"Could not open log file: {e}")
+    except Exception as exc:
+        log.warning(f"Could not open log file: {exc}")
 
 
-def _open_medecin_log(icon, item) -> None:  # noqa: ARG001
+def _open_medecin_log(icon, item) -> None:   # noqa: ARG001
     try:
         os.startfile(str(_get_medecin_log_path()))
-    except Exception as e:
-        log.warning(f"Could not open doctor report: {e}")
+    except Exception as exc:
+        log.warning(f"Could not open doctor report: {exc}")
 
 
 def _quit(icon, item) -> None:  # noqa: ARG001
@@ -202,33 +175,48 @@ def _quit(icon, item) -> None:  # noqa: ARG001
     icon.stop()
 
 
-# Network
-def wait_for_network_share() -> None:
-    is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
-    if not is_network:
-        return
-    attempt = 0
-    while not SOURCE_DIR.is_dir():
-        attempt += 1
-        log.warning(
-            f"Network share not reachable: {SOURCE_DIR}  "
-            f"(attempt {attempt}, retrying in {_NETWORK_SHARE_POLL}s)"
+# System utilities
+def prevent_sleep() -> None:
+    """Prevents Windows from sleeping while the router is active."""
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 |  # ES_CONTINUOUS
+            0x00000001    # ES_SYSTEM_REQUIRED
         )
-        time.sleep(_NETWORK_SHARE_POLL)
-    if attempt:
-        log.info(f"Network share accessible after {attempt} attempt(s): {SOURCE_DIR}")
+        log.info("Sleep prevention active.")
+    except Exception as exc:
+        log.warning(f"Could not set execution state: {exc}")
 
 
-# Access database
-def db_connect(mdb_path: Path):
-    return pyodbc.connect(
-        f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
-    )
+# Patient folder resolution
+def _resolve_patient_folder(code: str, nom: str, prenom: str) -> "Path | None":
+    """
+    Derives the patient photo folder using the Studio Vision naming convention.
+    Format: DEST_PHOTOS / <first2digits>.000 / <code><nom3>.<prenom3>
+    Returns the resolved Path if it exists on disk, otherwise None.
+    """
+    code_str     = str(code).strip()
+    nom_clean    = nom.strip().lower()
+    prenom_clean = prenom.strip().lower()
 
+    if len(code_str) < 2:
+        log.error(f"Patient code too short to resolve folder: '{code_str}'")
+        return None
+
+    folder = DEST_PHOTOS / f"{code_str[:2]}.000" / f"{code_str}{nom_clean[:3]}.{prenom_clean[:3]}"
+
+    if not folder.is_dir():
+        log.error(f"Resolved folder does not exist: {folder} (patient {code_str} / {nom.upper()} {prenom})")
+        return None
+
+    log.info(f"Patient folder resolved: {folder}")
+    return folder
+
+
+# Access COM — read active patient
 
 def get_active_patient() -> dict | None:
-    if not WIN32_AVAILABLE:
-        return None
+    """Reads patient identity fields from the currently open Access form."""
     try:
         access = win32com.client.GetActiveObject("Access.Application")
         form   = access.Screen.ActiveForm
@@ -250,91 +238,18 @@ def get_active_patient() -> dict | None:
             return None
 
         return {
-            "code":   str(data[ACCESS_FIELD_CODE]),
-            "nom":    str(data[ACCESS_FIELD_NOM]),
-            "prenom": str(data[ACCESS_FIELD_PRENOM]),
+            "code":   str(data[ACCESS_FIELD_CODE]).strip(),
+            "nom":    str(data[ACCESS_FIELD_NOM]).strip(),
+            "prenom": str(data[ACCESS_FIELD_PRENOM]).strip(),
         }
 
-    except Exception as e:
-        log.debug(f"COM error: {e}")
+    except Exception as exc:
+        log.debug(f"COM get_active_patient error: {exc}")
         return None
-
-
-def find_patient_folder(patient_code: str) -> Path | None:
-    if not PYODBC_AVAILABLE:
-        log.error("pyodbc not available.")
-        return None
-    if not PUBLIC_MDB.exists():
-        log.error(f"PUBLIC.MDB not found: {PUBLIC_MDB}")
-        return None
-    try:
-        conn   = db_connect(PUBLIC_MDB)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT TOP 1 [Photo externe] FROM Documents "
-            "WHERE [code patient] = ? AND [Photo externe] IS NOT NULL",
-            (int(patient_code),)
-        )
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row or not row[0]:
-            log.warning(f"No existing document found for patient {patient_code}.")
-            return None
-
-        parts = row[0].strip().strip("\\").split("\\")
-        if len(parts) < 2:
-            log.error(f"Unexpected Photo externe format: {row[0]}")
-            return None
-
-        folder = DEST_PHOTOS / parts[0] / parts[1]
-        if not folder.is_dir():
-            log.error(f"Folder found in DB but missing on disk: {folder}")
-            return None
-
-        log.info(f"Patient folder resolved: {folder}")
-        return folder
-    except Exception as e:
-        log.error(f"DB folder lookup failed: {e}")
-        return None
-
-
-def insert_document(patient: dict, relative_path: str, description: str) -> bool:
-    """Inserts a document record into the DB. Returns True on success."""
-    if not PYODBC_AVAILABLE:
-        log.warning("pyodbc not available, insert skipped.")
-        return False
-    if not PUBLIC_MDB.exists():
-        log.error("PUBLIC.MDB not found, insert skipped.")
-        return False
-    try:
-        conn   = db_connect(PUBLIC_MDB)
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO Documents
-                ([code patient], [Date], DESCRIPTIONS, TEXTE, [Photo externe], TypeVW, NumDocExterne)
-            VALUES (?, ?, ?, ?, ?, 99, NULL)
-            """,
-            (int(patient["code"]), datetime.now(), description, relative_path, relative_path)
-        )
-        conn.commit()
-        conn.close()
-        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={PUBLIC_MDB.name}")
-        return True
-    except Exception as e:
-        log.error(f"DB insert failed: {e}")
-        return False
-
-
-# Access UI refresh
-_AC_SUBFORM = 112
-
-# Delay (seconds) between commit() and Requery/MoveLast to allow Jet/ACE to finalize the write.
-_UI_POST_COMMIT_DELAY = 0.5
 
 
 def _find_sfdoc(form):
+    """Recursively searches the form's control tree for the SFDoc subform."""
     for i in range(form.Controls.Count):
         ctrl = form.Controls(i)
         try:
@@ -350,98 +265,70 @@ def _find_sfdoc(form):
     return None
 
 
-def refresh_ui(expected_patient_code: str | None = None) -> None:
+# GUI insertion
+def _insert_via_com(patient: dict, relative_path: str, description: str) -> bool:
     """
-    Refreshes the Access UI after an INSERT.
-    Waits _UI_POST_COMMIT_DELAY before Requery to let Jet/ACE finalize the write,
-    then calls MoveLast() to select the newly inserted record.
+    Inserts a new record into the SFDoc subform via win32com GUI automation.
+    Calls AddNew(), fills 'Photo externe' and 'TEXTE', calls Update(),
+    then Requery() (with retries) + MoveLast() to refresh the UI.
+    Returns True on success, False on any COM error.
     """
-    if not WIN32_AVAILABLE:
-        return
     try:
         access = win32com.client.GetActiveObject("Access.Application")
         form   = access.Screen.ActiveForm
         if form is None:
-            log.warning("Refresh skipped: no active form in Access.")
-            return
-
-        if expected_patient_code is not None:
-            current      = get_active_patient()
-            current_code = current["code"] if current else None
-            if current_code != expected_patient_code:
-                log.warning(
-                    f"Refresh skipped: active patient changed "
-                    f"(expected={expected_patient_code}, current={current_code})."
-                )
-                return
-
-        try:
-            form.Refresh()
-            log.info(f"Refresh() on parent form '{form.Name}'")
-        except Exception as e_ref:
-            log.warning(f"Refresh() on parent form failed ({e_ref}), continuing...")
+            log.error("COM insert failed: no active Access form.")
+            return False
 
         sfdoc = _find_sfdoc(form)
         if sfdoc is None:
-            log.warning(
-                f"Subform '{SFDOC_SUBFORM_NAME}' not found in the active form. "
-                "SFDoc refresh skipped."
-            )
-            return
+            log.error(f"COM insert failed: subform '{SFDOC_SUBFORM_NAME}' not found.")
+            return False
 
-        try:
-            if form.Dirty:
-                log.info("Parent form is dirty; clearing before Requery.")
-                form.Dirty = False
-        except Exception as e_dirty:
-            log.debug(f"Dirty check/clear failed ({e_dirty}), continuing...")
+        rs = sfdoc.Recordset
+        rs.AddNew()
+        rs.Fields("Photo externe").Value = relative_path
+        rs.Fields("TEXTE").Value         = relative_path
+        rs.Update()
+        log.info(f"COM insert OK: patient={patient['code']} path='{relative_path}' desc='{description}'")
 
-        log.debug(f"Waiting {_UI_POST_COMMIT_DELAY}s before Requery (post-commit settle)...")
-        time.sleep(_UI_POST_COMMIT_DELAY)
-
-        _REQUERY_ATTEMPTS = 3
-        _REQUERY_DELAY    = 0.5
+        # Allow ACE engine to finalise the write before Requery
+        time.sleep(0.5)
 
         requery_ok = False
-        for attempt in range(1, _REQUERY_ATTEMPTS + 1):
+        for attempt in range(1, 4):
             try:
                 sfdoc.Requery()
-                log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}' (attempt {attempt})")
+                log.info(f"Requery() on '{SFDOC_SUBFORM_NAME}' (attempt {attempt}).")
                 requery_ok = True
                 break
-            except Exception as e_req:
-                log.warning(
-                    f"Requery() attempt {attempt}/{_REQUERY_ATTEMPTS} failed "
-                    f"on '{SFDOC_SUBFORM_NAME}': {e_req}"
-                )
-                if attempt < _REQUERY_ATTEMPTS:
-                    time.sleep(_REQUERY_DELAY)
+            except Exception as exc_rq:
+                log.warning(f"Requery() attempt {attempt}/3 failed: {exc_rq}")
+                if attempt < 3:
+                    time.sleep(0.5)
 
         if not requery_ok:
-            log.warning(
-                f"All {_REQUERY_ATTEMPTS} Requery() attempts failed on "
-                f"'{SFDOC_SUBFORM_NAME}'; falling back to Refresh()."
-            )
+            log.warning(f"All Requery() attempts failed on '{SFDOC_SUBFORM_NAME}'; falling back to Refresh().")
             try:
                 sfdoc.Refresh()
-                log.info(f"Fallback Refresh() on '{SFDOC_SUBFORM_NAME}'")
-            except Exception as e_ref2:
-                log.warning(
-                    f"Fallback Refresh() also failed on '{SFDOC_SUBFORM_NAME}': {e_ref2}"
-                )
+            except Exception as exc_ref:
+                log.warning(f"Fallback Refresh() also failed: {exc_ref}")
 
         try:
             sfdoc.Recordset.MoveLast()
-            log.info(f"MoveLast() on '{SFDOC_SUBFORM_NAME}' — last record selected.")
-        except Exception as e_ml:
-            log.debug(f"MoveLast() failed on '{SFDOC_SUBFORM_NAME}': {e_ml}")
+        except Exception as exc_ml:
+            log.debug(f"MoveLast() failed: {exc_ml}")
 
-    except Exception as e:
-        log.warning(f"COM refresh failed (non-blocking): {e}")
+        return True
+
+    except Exception as exc:
+        log.error(f"COM insert/refresh failed: {exc}")
+        return False
 
 
-# File operations
+# File utilities
 def wait_for_file(file: Path) -> bool:
+    """Blocks until the file is readable. Returns False if max attempts are exceeded."""
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
             with file.open("rb"):
@@ -453,137 +340,43 @@ def wait_for_file(file: Path) -> bool:
     return False
 
 
-def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
+def move_file(source: Path, dest_folder: Path, label: str = "") -> "Path | None":
+    """Moves source to dest_folder, resolving name conflicts with a timestamp suffix."""
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
     if dest.exists():
         ts   = int(time.time())
         dest = dest_folder / f"{source.stem}_{ts}{source.suffix}"
-        log.info(f"Name conflict, renamed to {dest.name}")
+        log.info(f"Name conflict — renamed to {dest.name}")
     try:
         shutil.move(str(source), str(dest))
         tag = f"[{label}]  " if label else ""
         log.info(f"{tag}{source.name} -> {dest}")
         return dest
-    except Exception as e:
-        log.error(f"Move failed: {e}")
+    except Exception as exc:
+        log.error(f"Move failed: {exc}")
         return None
 
 
 def orphan_file(file: Path) -> None:
+    """Moves an unprocessable file to the orphan directory."""
     log.warning(f"Orphaning: {file.name}")
     move_file(file, ORPHAN_DIR, label="ORPHAN")
 
 
-def prevent_sleep() -> None:
-    try:
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            0x80000000 |  # ES_CONTINUOUS
-            0x00000001    # ES_SYSTEM_REQUIRED
-        )
-        log.info("Sleep prevention active.")
-    except Exception as e:
-        log.warning(f"Could not set execution state: {e}")
-
-
-# Retry queue for deferred DB inserts
-# Each entry: { "file", "patient", "relative_path", "description", "attempt", "next_try" }
-_retry_queue: list[dict] = []
-_retry_lock  = threading.Lock()
-
-
-def _schedule_retry(file: Path, patient: dict, relative_path: str,
-                    description: str, attempt: int = 0) -> None:
-    """Schedules a failed insert for retry with progressive delay. Orphans after max attempts."""
-    if attempt >= len(RETRY_DELAYS):
-        log.error(
-            f"Max retry attempts reached for '{file.name}' "
-            f"(patient {patient['code']}). Orphaning."
-        )
-        log_medecin(
-            f"ERREUR : Impossible d'ajouter la photo '{file.name}' après "
-            f"{len(RETRY_DELAYS)} tentatives (Réseau déconnecté ou base inaccessible)."
-        )
-        orphan_file(file)
-        return
-
-    delay    = RETRY_DELAYS[attempt]
-    next_try = time.monotonic() + delay
-    entry    = {
-        "file":          file,
-        "patient":       patient,
-        "relative_path": relative_path,
-        "description":   description,
-        "attempt":       attempt,
-        "next_try":      next_try,
-    }
-    with _retry_lock:
-        _retry_queue.append(entry)
-
-    log.warning(
-        f"DB insert failed for '{file.name}' — "
-        f"scheduled retry #{attempt + 1} in {delay}s."
-    )
-    log_medecin(
-        f"AVERTISSEMENT : Échec temporaire pour la photo '{file.name}' "
-        f"(patient {patient['nom']} {patient['prenom']}, Code: {patient['code']}). "
-        f"Nouvelle tentative dans {delay} secondes."
-    )
-
-
-def _process_retry_queue(file_queue: queue.Queue) -> None:
-    """Processes due retry entries. On success triggers a UI refresh; on failure reschedules."""
-    now      = time.monotonic()
-    to_retry: list[dict] = []
-
-    with _retry_lock:
-        remaining = []
-        for entry in _retry_queue:
-            if entry["next_try"] <= now:
-                to_retry.append(entry)
-            else:
-                remaining.append(entry)
-        _retry_queue[:] = remaining
-
-    for entry in to_retry:
-        file          = entry["file"]
-        patient       = entry["patient"]
-        relative_path = entry["relative_path"]
-        description   = entry["description"]
-        attempt       = entry["attempt"]
-
-        log.info(
-            f"Retry #{attempt + 1} for '{file.name}' "
-            f"(patient {patient['code']})..."
-        )
-
-        if insert_document(patient, relative_path, description):
-            log.info(f"Retry #{attempt + 1} succeeded for '{file.name}'.")
-            log_medecin(
-                f"SUCCÈS (rattrapage) : Photo '{file.name}' ajoutée au dossier de "
-                f"{patient['nom']} {patient['prenom']} (Code: {patient['code']})."
-            )
-            _notify("Rattrapage OK", f"{file.name} inséré après {attempt + 1} tentative(s)")
-            refresh_ui(expected_patient_code=patient["code"])
-        else:
-            _schedule_retry(file, patient, relative_path, description, attempt + 1)
-
-
 # Startup scan and periodic catchup
 def _scan_source_for_missed_files(file_queue: queue.Queue) -> None:
-    """Enqueues files present in SOURCE_DIR that were missed during downtime.
-    Uses a flat scan: SOURCE_DIR is a staging folder, not a tree."""
+    """Enqueues files present in SOURCE_DIR that were missed during downtime."""
     if not SOURCE_DIR.is_dir():
         log.warning(f"Catchup scan skipped: {SOURCE_DIR} not accessible.")
         return
-
     found: list[Path] = []
     try:
-        for item in SOURCE_DIR.iterdir():       # Flat scan only — SOURCE_DIR is not a tree
+        for item in SOURCE_DIR.iterdir():
             if item.is_file() and item.suffix.lower() in WATCHED_EXTENSIONS:
                 found.append(item)
-    except Exception as e:
-        log.error(f"Error during catchup scan: {e}")
+    except Exception as exc:
+        log.error(f"Error during catchup scan: {exc}")
         return
 
     if not found:
@@ -597,57 +390,49 @@ def _scan_source_for_missed_files(file_queue: queue.Queue) -> None:
 
 
 def _catchup_loop(file_queue: queue.Queue) -> None:
-    """Periodically scans SOURCE_DIR and processes the retry queue."""
+    """Periodically re-scans SOURCE_DIR for files that may have been missed."""
     log.info(f"Catchup thread started (interval: {CATCHUP_INTERVAL}s).")
     while not _stop_event.is_set():
         for _ in range(CATCHUP_INTERVAL):
             if _stop_event.is_set():
                 break
             time.sleep(1)
-
         if _stop_event.is_set():
             break
-
-        log.debug("Catchup: scanning SOURCE_DIR + processing retry queue...")
+        log.debug("Catchup: scanning SOURCE_DIR...")
         _scan_source_for_missed_files(file_queue)
-        _process_retry_queue(file_queue)
-
     log.info("Catchup thread stopped.")
 
 
-# Worker (queue consumer)
+# Worker thread
 def worker(file_queue: queue.Queue) -> None:
+    """
+    Consumes files from the queue.
+    For each file: wait for unlock → wait for open patient → resolve folder
+    → move file → COM insert.
+    """
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    needs_refresh: bool           = False
-    last_patient_code: str | None = None
-    burst_count: int              = 0
+    burst_count: int = 0
 
     try:
         while True:
             try:
                 file: Path = file_queue.get(timeout=1.5)
             except queue.Empty:
-                if needs_refresh:
-                    log.info("Burst complete — triggering batched UI refresh.")
-                    refresh_ui(expected_patient_code=last_patient_code)
-                    needs_refresh     = False
-                    last_patient_code = None
-                    _notify(
-                        "Transfer complete",
-                        f"{burst_count} file(s) processed",
-                    )
+                if burst_count:
+                    _notify("Transfer complete", f"{burst_count} file(s) processed")
                     _set_status(f"{BOX_NAME} — Ready", processing=False)
                     burst_count = 0
                 continue
-            except Exception as e:
-                log.error(f"Queue error: {e}")
+            except Exception as exc:
+                log.error(f"Queue error: {exc}")
                 continue
 
             log.info(f"Processing: {file.name} ({file_queue.qsize()} pending)")
 
-            if burst_count == 0 and not needs_refresh:
+            if burst_count == 0:
                 _notify("Transfer in progress", file.name)
             _set_status("Transfer in progress...", processing=True)
 
@@ -657,11 +442,12 @@ def worker(file_queue: queue.Queue) -> None:
                 continue
 
             if not wait_for_file(file):
-                log.error(f"Aborting, persistent lock: {file.name}")
+                log.error(f"Aborting — persistent lock: {file.name}")
                 _notify("Error", f"File locked: {file.name}")
                 file_queue.task_done()
                 continue
 
+            # Wait for an open patient record in Access
             patient    = None
             start_time = time.monotonic()
             first_log  = True
@@ -673,14 +459,13 @@ def worker(file_queue: queue.Queue) -> None:
 
                 elapsed = time.monotonic() - start_time
                 if elapsed >= PATIENT_WAIT_TIMEOUT:
-                    # Wrap in try/finally to guarantee task_done() even if orphan_file raises,
-                    # preventing file_queue.join() from blocking indefinitely on shutdown.
                     try:
                         orphan_file(file)
                         _notify("Orphan file", file.name)
                         log_medecin(
                             f"AVERTISSEMENT : Fichier '{file.name}' orphelin "
-                            f"(aucun patient ouvert après {PATIENT_WAIT_TIMEOUT // 60} min)."
+                            f"(aucun patient ouvert après "
+                            f"{PATIENT_WAIT_TIMEOUT // 60} min)."
                         )
                     finally:
                         file_queue.task_done()
@@ -689,7 +474,7 @@ def worker(file_queue: queue.Queue) -> None:
 
                 if first_log:
                     log.info(
-                        f"No patient open, waiting "
+                        f"No patient open — waiting "
                         f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
                     )
                     first_log = False
@@ -704,7 +489,9 @@ def worker(file_queue: queue.Queue) -> None:
                 f"(code {patient['code']})"
             )
 
-            patient_folder = find_patient_folder(patient["code"])
+            patient_folder = _resolve_patient_folder(
+                patient["code"], patient["nom"], patient["prenom"]
+            )
             if not patient_folder:
                 log.error(
                     f"Could not resolve folder for patient {patient['code']}. "
@@ -729,53 +516,47 @@ def worker(file_queue: queue.Queue) -> None:
             relative_path = f"\\{group_name}\\{patient_folder.name}\\{dest.name}"
             description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
-            if insert_document(patient, relative_path, description):
-                needs_refresh     = True
-                last_patient_code = patient["code"]
-                burst_count      += 1
-                log.debug("Insert OK — refresh deferred to burst end.")
+            if _insert_via_com(patient, relative_path, description):
+                burst_count += 1
                 log_medecin(
                     f"SUCCÈS : Photo '{dest.name}' ajoutée au dossier de "
-                    f"{patient['nom']} {patient['prenom']} (Code: {patient['code']})."
+                    f"{patient['nom']} {patient['prenom']} "
+                    f"(Code: {patient['code']})."
                 )
             else:
-                log.warning("Insert failed — scheduling retry.")
-                _notify("DB Error", f"Insert failed — retry scheduled for {file.name}")
-                _schedule_retry(dest, patient, relative_path, description, attempt=0)
+                log.error(
+                    f"COM insert failed for '{dest.name}' — "
+                    "file was moved but record not created. "
+                    "Manual insertion may be required."
+                )
+                _notify("COM Error", f"Insert failed for {dest.name}")
+                log_medecin(
+                    f"ERREUR COM : Photo '{dest.name}' déplacée mais NON insérée "
+                    f"dans le dossier de {patient['nom']} {patient['prenom']} "
+                    f"(Code: {patient['code']}). Insertion manuelle requise."
+                )
 
             file_queue.task_done()
 
     finally:
-        if needs_refresh:
-            log.info("Worker shutting down — flushing pending UI refresh.")
-            refresh_ui(expected_patient_code=last_patient_code)
-            if burst_count:
-                _notify("Transfer complete", f"{burst_count} file(s) processed")
         _set_status(f"{BOX_NAME} — Stopped")
         pythoncom.CoUninitialize()
 
 
 # Watchdog producer
 class ImageProducer(FileSystemEventHandler):
-    """Watchdog event handler for the OM staging folder.
-
-    PollingObserver detects files arriving via shutil.move() as FileCreatedEvent
-    because it diffs directory snapshots rather than observing OS rename calls.
-    on_moved is retained as a defensive fallback.
-    on_modified handles the edge case where PollingObserver emits a modified event
-    before created when a file is written in chunks.
-    A short-lived seen-set prevents duplicate enqueuing if multiple event types
-    fire for the same path within the same poll cycle.
+    """
+    Watchdog event handler for the OM staging folder.
+    A 5-second seen-set prevents duplicate enqueuing across created/moved/modified events.
     """
 
     def __init__(self, file_queue: queue.Queue) -> None:
         super().__init__()
-        self._queue     = file_queue
+        self._queue      = file_queue
         self._seen: set[str] = set()
-        self._seen_lock = threading.Lock()
+        self._seen_lock  = threading.Lock()
 
     def _enqueue(self, path: Path, reason: str) -> None:
-        """Thread-safe enqueue with 5-second deduplication window."""
         key = str(path)
         with self._seen_lock:
             if key in self._seen:
@@ -783,55 +564,44 @@ class ImageProducer(FileSystemEventHandler):
                 return
             self._seen.add(key)
 
-        # Remove the key after the deduplication window so the same filename
-        # can be re-enqueued if it reappears later (e.g. after a retry).
         def _clear_key():
             time.sleep(5)
             with self._seen_lock:
                 self._seen.discard(key)
 
         threading.Thread(target=_clear_key, daemon=True).start()
-
-        log.info(f"Enqueued ({reason}): {path.name} (queue size: {self._queue.qsize() + 1})")
+        log.info(
+            f"Enqueued ({reason}): {path.name} "
+            f"(queue size: {self._queue.qsize() + 1})"
+        )
         self._queue.put(path)
 
     def on_created(self, event) -> None:
-        if event.is_directory:
-            return
-        path = Path(event.src_path)
-        if path.suffix.lower() not in WATCHED_EXTENSIONS:
-            return
-        self._enqueue(path, "created")
+        if not event.is_directory:
+            path = Path(event.src_path)
+            if path.suffix.lower() in WATCHED_EXTENSIONS:
+                self._enqueue(path, "created")
 
     def on_moved(self, event) -> None:
-        # Fires when a same-volume rename is observed at the OS level.
-        # With PollingObserver this is uncommon but retained for correctness.
-        if event.is_directory:
-            return
-        path = Path(event.dest_path)
-        if path.suffix.lower() not in WATCHED_EXTENSIONS:
-            return
-        self._enqueue(path, "moved")
+        if not event.is_directory:
+            path = Path(event.dest_path)
+            if path.suffix.lower() in WATCHED_EXTENSIONS:
+                self._enqueue(path, "moved")
 
     def on_modified(self, event) -> None:
-        # PollingObserver may emit modified before created for chunked writes.
-        # Only enqueue if the file is already present on disk.
-        if event.is_directory:
-            return
-        path = Path(event.src_path)
-        if path.suffix.lower() not in WATCHED_EXTENSIONS:
-            return
-        if path.exists():
-            self._enqueue(path, "modified")
+        if not event.is_directory:
+            path = Path(event.src_path)
+            if path.suffix.lower() in WATCHED_EXTENSIONS and path.exists():
+                self._enqueue(path, "modified")
 
 
-# Background thread (watchdog + network reconnect)
+# Background observer thread
 def _run_background(file_queue: queue.Queue) -> None:
+    """Starts and monitors the filesystem observer. Reconnects on failures."""
     _RECONNECT_WAIT = 15
 
     def _start_observer() -> Observer:
         obs = Observer()
-        # recursive=False: SOURCE_DIR is a flat staging folder.
         obs.schedule(ImageProducer(file_queue), str(SOURCE_DIR), recursive=False)
         obs.start()
         log.info("Observer started — watching for images.")
@@ -843,14 +613,13 @@ def _run_background(file_queue: queue.Queue) -> None:
     try:
         while not _stop_event.is_set():
             if not observer.is_alive():
-                log.warning("Observer stopped (network drop?). Attempting reconnect...")
+                log.warning("Observer stopped. Attempting reconnect...")
                 _set_status(f"{BOX_NAME} — Reconnecting...", processing=False)
                 try:
                     observer.stop()
                     observer.join(timeout=5)
                 except Exception:
                     pass
-                wait_for_network_share()
                 log.info(f"Waiting {_RECONNECT_WAIT}s before restarting observer...")
                 time.sleep(_RECONNECT_WAIT)
                 observer = _start_observer()
@@ -868,16 +637,106 @@ def _run_background(file_queue: queue.Queue) -> None:
             _icon.stop()
 
 
+# Studio Vision lifecycle
+def _get_msaccess_pids() -> set[int]:
+    """Returns the set of all running msaccess.exe PIDs."""
+    pids: set[int] = set()
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if (proc.info["name"] or "").lower() == "msaccess.exe":
+                pids.add(proc.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return pids
+
+
+def _launch_studio_vision() -> None:
+    """
+    Launches Studio Vision OM and monitors all msaccess.exe processes.
+    Handles the /runtime 2-stage relay by diffing PIDs before/after launch.
+    Force-kills tracked processes on exit to release COM locks.
+    """
+    log.info(f"Launching Studio Vision: {' '.join(STUDIO_VISION_CMD)}")
+    pids_before: set[int] = _get_msaccess_pids()
+
+    try:
+        subprocess.Popen(STUDIO_VISION_CMD)
+    except FileNotFoundError:
+        log.critical("Studio Vision executable not found. Shutting down.")
+        _stop_event.set()
+        return
+    except Exception as exc:
+        log.error(f"Could not launch Studio Vision: {exc}. Shutting down.")
+        _stop_event.set()
+        return
+
+    log.info(f"Waiting up to {_SV_STARTUP_TIMEOUT}s for msaccess.exe to start...")
+    deadline = time.monotonic() + _SV_STARTUP_TIMEOUT
+
+    while time.monotonic() < deadline and not _stop_event.is_set():
+        if _get_msaccess_pids() - pids_before:
+            log.info("Studio Vision is starting...")
+            break
+        time.sleep(1)
+    else:
+        if not _stop_event.is_set():
+            log.error("msaccess.exe did not appear. Shutting down.")
+            _stop_event.set()
+        return
+
+    consecutive_empty = 0
+    _EMPTY_THRESHOLD  = 2
+    tracked_pids: set[int] = set()
+
+    try:
+        while not _stop_event.is_set():
+            time.sleep(_SV_POLL_INTERVAL)
+            current_pids = _get_msaccess_pids() - pids_before
+            tracked_pids.update(current_pids)
+
+            if not current_pids:
+                consecutive_empty += 1
+                log.debug(
+                    f"Studio Vision missing "
+                    f"({consecutive_empty}/{_EMPTY_THRESHOLD})."
+                )
+                if consecutive_empty >= _EMPTY_THRESHOLD:
+                    log.info("Studio Vision closed by user. Initiating shutdown.")
+                    break
+            else:
+                consecutive_empty = 0
+    except Exception as exc:
+        log.error(f"Error while monitoring msaccess.exe: {exc}")
+    finally:
+        for pid in tracked_pids:
+            try:
+                p = psutil.Process(pid)
+                if p.is_running():
+                    p.kill()
+                    log.info(f"Force-killed zombie msaccess.exe (PID {pid}) to release COM locks.")
+            except Exception:
+                pass
+
+        _stop_event.set()
+        if _icon is not None:
+            try:
+                _icon.stop()
+            except Exception:
+                pass
+
+
 # Entry point
 def main() -> None:
     global _icon, _mutex_handle
 
     # Single-instance guard
-    _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_OM_Mutex")
+    _mutex_handle = win32event.CreateMutex(
+        None, False, "ImageRouter_StudioVision_OM_V6_Mutex"
+    )
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 
-    # Block manual double-click restart while Studio Vision is running
+    # Prevent manual restart while Studio Vision is running
     try:
         parent_name = psutil.Process(os.getpid()).parent().name().lower()
     except Exception:
@@ -885,14 +744,14 @@ def main() -> None:
 
     if parent_name == "explorer.exe":
         sv_running = any(
-            (p.info["name"] or "").lower() == STUDIO_VISION_EXE
+            (p.info["name"] or "").lower() == "msaccess.exe"
             for p in psutil.process_iter(["name"])
         )
         if sv_running:
             ctypes.windll.user32.MessageBoxW(
                 0,
                 "To restart the image router, please fully close and relaunch Studio Vision.",
-                "Image Router",
+                "Image Router OM",
                 0x30,
             )
             sys.exit(0)
@@ -905,77 +764,44 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Version 5.1 started (OM)")
-    log.info(f"  Source     : {SOURCE_DIR}")
-    log.info(f"  Dest       : {DEST_PHOTOS}")
-    log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
-    log.info(f"  DOCUM.MDB  : {DOCUM_MDB}")
-    log.info(f"  Orphans    : {ORPHAN_DIR}")
-    log.info(f"  Log file   : {_LOG_FILE}")
-    log.info(f"  Timeout    : {PATIENT_WAIT_TIMEOUT // 60} min")
-    log.info(f"  Ext        : {', '.join(sorted(WATCHED_EXTENSIONS))}")
-    log.info(f"  Catchup    : every {CATCHUP_INTERVAL}s")
-    log.info(f"  Retry      : {RETRY_DELAYS}")
-    log.info(f"  Doctor log : {_get_medecin_log_path()}")
+    log.info("=== Studio Vision Image Router — Version 6.0 (OM) ===")
+    log.info(f"  Source      : {SOURCE_DIR}")
+    log.info(f"  Dest photos : {DEST_PHOTOS}")
+    log.info(f"  Orphans     : {ORPHAN_DIR}")
+    log.info(f"  Log file    : {_LOG_FILE}")
+    log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
+    log.info(f"  Extensions  : {', '.join(sorted(WATCHED_EXTENSIONS))}")
+    log.info(f"  Catchup     : every {CATCHUP_INTERVAL}s")
+    log.info(f"  Doctor log  : {_get_medecin_log_path()}")
 
-    log_medecin(
-        f"Démarrage du routeur d'images (version 5.1 OM). "
-        f"Surveillance de : {SOURCE_DIR}"
-    )
+    log_medecin(f"Démarrage du routeur d'images (version 6.0 OM). Surveillance de : {SOURCE_DIR}")
 
     file_queue: queue.Queue = queue.Queue()
 
-    # 1. Worker (consumer)
-    threading.Thread(
-        target=worker, args=(file_queue,), name="Worker", daemon=True
-    ).start()
+    threading.Thread(target=worker,        args=(file_queue,), name="Worker",     daemon=True).start()
+    threading.Thread(target=_catchup_loop, args=(file_queue,), name="Catchup",    daemon=True).start()
 
-    # 2. Startup scan: catch files dropped during downtime
     log.info("Startup scan — checking for pending files...")
     _scan_source_for_missed_files(file_queue)
 
-    # 3. Watchdog thread (main producer)
-    threading.Thread(
-        target=_run_background, args=(file_queue,), name="Background", daemon=True
-    ).start()
-
-    # 4. Catchup thread (periodic scan + retry)
-    threading.Thread(
-        target=_catchup_loop, args=(file_queue,), name="Catchup", daemon=True
-    ).start()
+    threading.Thread(target=_run_background, args=(file_queue,), name="Background", daemon=True).start()
 
     if not TRAY_AVAILABLE:
-        log.info("Headless mode — launching Studio Vision OM...")
-
-        triage_script = r"C:\Chemin\Vers\Ton\Dossier\studiovision_export.py"
+        log.info("Headless mode — launching dispatcher and Studio Vision OM...")
         try:
-            subprocess.Popen(["pythonw.exe", triage_script])
+            subprocess.Popen(["pythonw.exe", TRIAGE_SCRIPT])
             log.info("Dispatcher launched.")
-        except Exception as e:
-            log.error(f"Could not launch dispatcher: {e}")
+        except Exception as exc:
+            log.error(f"Could not launch dispatcher: {exc}")
 
-        cmd_om = [
-            r"C:\Studiov2000-OM\svprog\msaccess.exe",
-            "/runtime", r"C:\Studiov2000-OM\svprog\Ophprog.mde",
-            "/wrkgrp",  r"C:\Studiov2000-OM\config\system.mdw",
-            "/User", "/Pwd", "/X", "demarrage"
-        ]
-
-        try:
-            # Blocks until Studio Vision OM is closed by the user
-            subprocess.run(cmd_om, check=False)
-            log.info("Studio Vision OM closed.")
-        except FileNotFoundError:
-            log.error("msaccess.exe or Studio Vision OM not found.")
-        except Exception as e:
-            log.error(f"Error launching Studio Vision OM: {e}")
-        finally:
-            # Stop the monitor when the application exits or crashes
-            _stop_event.set()
-            log.info("OM monitor stopped (synced with application exit).")
-
+        _launch_studio_vision()
+        log.info("Studio Vision OM closed — OM monitor stopped.")
+        log_medecin("Arrêt du routeur d'images (version 6.0 OM).")
         return
 
+    # ------------------------------------------------------------------
+    # Tray mode
+    # ------------------------------------------------------------------
     menu = pystray.Menu(
         pystray.MenuItem(
             text=lambda item: _status_text,
@@ -983,9 +809,9 @@ def main() -> None:
             enabled=False,
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Open technical log", _open_logs),
-        pystray.MenuItem("Open doctor report", _open_medecin_log),
-        pystray.MenuItem("Quit", _quit),
+        pystray.MenuItem("Open technical log",  _open_logs),
+        pystray.MenuItem("Open doctor report",  _open_medecin_log),
+        pystray.MenuItem("Quit",                _quit),
     )
 
     _icon = pystray.Icon(
@@ -995,12 +821,20 @@ def main() -> None:
         menu=menu,
     )
 
+    try:
+        subprocess.Popen(["pythonw.exe", TRIAGE_SCRIPT])
+        log.info("Dispatcher launched.")
+    except Exception as exc:
+        log.error(f"Could not launch dispatcher: {exc}")
+
+    threading.Thread(target=_launch_studio_vision, name="SVLifecycle", daemon=True).start()
+
     log.info("System tray icon started.")
     _icon.run()
 
     _stop_event.set()
     log.info("Application stopped.")
-    log_medecin("Arrêt du routeur d'images.")
+    log_medecin("Arrêt du routeur d'images (version 6.0 OM).")
 
 
 if __name__ == "__main__":

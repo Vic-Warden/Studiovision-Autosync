@@ -690,8 +690,9 @@ def _get_msaccess_pids() -> set[int]:
 
 def _launch_studio_vision() -> None:
     """
-    Launches Studio Vision and monitors strictly its own msaccess.exe processes.
-    Forces termination of zombie processes on exit to release COM locks.
+    Launches Studio Vision and tracks any new msaccess.exe instances.
+    Handles the /runtime 2-stage startup relay correctly.
+    Forces termination of newly created zombie processes on exit.
     """
     log.info(f"Launching Studio Vision: {' '.join(STUDIO_VISION_CMD)}")
 
@@ -710,13 +711,10 @@ def _launch_studio_vision() -> None:
 
     log.info(f"Waiting up to {_SV_STARTUP_TIMEOUT}s for msaccess.exe to start...")
     deadline = time.monotonic() + _SV_STARTUP_TIMEOUT
-    tracked_pids: set[int] = set()
 
     while time.monotonic() < deadline and not _stop_event.is_set():
-        new_pids = _get_msaccess_pids() - pids_before
-        if new_pids:
-            tracked_pids = new_pids
-            log.info(f"Studio Vision running (PIDs: {sorted(tracked_pids)}).")
+        if _get_msaccess_pids() - pids_before:
+            log.info("Studio Vision is starting...")
             break
         time.sleep(1)
     else:
@@ -727,16 +725,19 @@ def _launch_studio_vision() -> None:
 
     consecutive_empty = 0
     _EMPTY_THRESHOLD  = 2
+    tracked_pids: set[int] = set()
 
     try:
         while not _stop_event.is_set():
             time.sleep(_SV_POLL_INTERVAL)
-            # 1. On vérifie UNIQUEMENT les PIDs que ce script a lancé, pas les autres
-            alive_pids = {pid for pid in tracked_pids if psutil.pid_exists(pid)}
+            
+            current_pids = _get_msaccess_pids() - pids_before
+            
+            tracked_pids.update(current_pids)
 
-            if not alive_pids:
+            if not current_pids:
                 consecutive_empty += 1
-                log.debug(f"Tracked msaccess.exe missing ({consecutive_empty}/{_EMPTY_THRESHOLD}).")
+                log.debug(f"Studio Vision missing ({consecutive_empty}/{_EMPTY_THRESHOLD}).")
                 if consecutive_empty >= _EMPTY_THRESHOLD:
                     log.info("Studio Vision closed by user. Initiating shutdown.")
                     break

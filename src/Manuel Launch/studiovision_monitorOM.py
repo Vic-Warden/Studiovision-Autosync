@@ -54,10 +54,15 @@ DEST_PHOTOS   = Path(r"\\studiovision\Studiov2000-OM\PHOTOS")        # Root of t
 TRIAGE_SCRIPT = r"C:\Chemin\Vers\Ton\Dossier\studiovision_export.py"  # Dispatcher script
 
 STUDIO_VISION_CMD = [
-    r"C:\Studiov2000\Svprog\MSACCESS.EXE",
-    "/runtime", r"C:\Studiov2000-OM\svprog\Ophprog.mde",
-    "/wrkgrp",  r"C:\Studiov2000-OM\config\system.mdw",
-    "/User", "/Pwd", "/X", "demarrage",
+    r"C:\Studiov2000-OM\svprog\msaccess.exe",
+    "/runtime",
+    r"C:\Studiov2000-OM\svprog\Ophprog.mde",
+    "/wrkgrp",
+    r"C:\Studiov2000-OM\config\system.mdw",
+    "/User",
+    "/Pwd",
+    "/X",
+    "demarrage",
 ]
 
 WATCHED_EXTENSIONS = {

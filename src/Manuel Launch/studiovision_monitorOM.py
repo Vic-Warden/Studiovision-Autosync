@@ -51,7 +51,7 @@ BOX_NAME = "Studiovision OM"
 SOURCE_DIR    = Path(r"C:\Users\Box-6\Desktop\OM")                  # Acquisition drop folder
 ORPHAN_DIR    = Path(r"C:\Users\Box-6\Desktop\Images_Oubliées")     # Unassignable file quarantine
 DEST_PHOTOS   = Path(r"\\studiovision\Studiov2000-OM\PHOTOS")        # Root of the patient photo tree
-TRIAGE_SCRIPT = r"C:\Chemin\Vers\Ton\Dossier\studiovision_export.py"  # Dispatcher script
+TRIAGE_SCRIPT = r"C:\INFO-BOX-CV\Auto Récup\studiovision_export.py"  # Dispatcher script
 
 STUDIO_VISION_CMD = [
     r"C:\Studiov2000-OM\svprog\msaccess.exe",
@@ -741,26 +741,6 @@ def main() -> None:
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 
-    # Prevent manual restart while Studio Vision is running
-    try:
-        parent_name = psutil.Process(os.getpid()).parent().name().lower()
-    except Exception:
-        parent_name = ""
-
-    if parent_name == "explorer.exe":
-        sv_running = any(
-            (p.info["name"] or "").lower() == "msaccess.exe"
-            for p in psutil.process_iter(["name"])
-        )
-        if sv_running:
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "To restart the image router, please fully close and relaunch Studio Vision.",
-                "Image Router OM",
-                0x30,
-            )
-            sys.exit(0)
-
     prevent_sleep()
 
     if not SOURCE_DIR.exists():
@@ -804,9 +784,7 @@ def main() -> None:
         log_medecin("Arrêt du routeur d'images (version 6.0 OM).")
         return
 
-    # ------------------------------------------------------------------
     # Tray mode
-    # ------------------------------------------------------------------
     menu = pystray.Menu(
         pystray.MenuItem(
             text=lambda item: _status_text,

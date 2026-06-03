@@ -52,7 +52,7 @@ BOX_NAME = "Studiovision HR"
 SOURCE_DIR    = Path(r"C:\Users\Box-6\Desktop\HR")                  # Acquisition drop folder
 ORPHAN_DIR    = Path(r"C:\Users\Box-6\Desktop\Images_Oubliées")     # Unassignable file quarantine
 DEST_PHOTOS   = Path(r"\\studiovision\Studiov2000\PHOTOS")           # Root of the patient photo tree
-TRIAGE_SCRIPT = r"C:\Chemin\Vers\Ton\Dossier\studiovision_export.py"  # Dispatcher script
+TRIAGE_SCRIPT = r"C:\INFO-BOX-CV\Auto Récup\studiovision_export.py"  # Dispatcher script
 
 STUDIO_VISION_CMD = [
     r"C:\Studiov2000\Svprog\MSACCESS.EXE",
@@ -710,26 +710,6 @@ def main() -> None:
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_HR_V6_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
-
-    # Prevent manual restart while Studio Vision is running
-    try:
-        parent_name = psutil.Process(os.getpid()).parent().name().lower()
-    except Exception:
-        parent_name = ""
-
-    if parent_name == "explorer.exe":
-        sv_running = any(
-            (p.info["name"] or "").lower() == "msaccess.exe"
-            for p in psutil.process_iter(["name"])
-        )
-        if sv_running:
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "To restart the image router, please fully close and relaunch Studio Vision.",
-                "Image Router HR",
-                0x30,
-            )
-            sys.exit(0)
 
     prevent_sleep()
 

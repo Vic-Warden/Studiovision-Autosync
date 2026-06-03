@@ -217,18 +217,28 @@ def _resolve_patient_folder(code: str, nom: str, prenom: str) -> "Path | None":
 # Access COM — read active patient
 def _get_access_app():
     """
-    Returns the Access.Application COM object bound to this instance.
-    Scans the ROT to avoid returning the wrong instance when multiple
-    msaccess.exe processes are running. Falls back to GetActiveObject.
+    Returns the correct Access.Application COM object for THIS instance.
+
+    When two msaccess.exe processes run simultaneously (HR + OM on same PC),
+    GetActiveObject("Access.Application") always returns the first one registered
+    in the ROT (Running Object Table) — which may be the wrong instance.
+
+    Instead we iterate every Access.Application entry in the ROT and match by
+    the PID of the msaccess.exe process we launched ourselves (_sv_access_app
+    is set by _launch_studio_vision as soon as the PID is known).
+
+    Falls back to GetActiveObject if the bound app is unavailable.
     """
     global _sv_access_app
     if _sv_access_app is not None:
         try:
+            # Quick liveness check — if it raises, the app has gone away.
             _ = _sv_access_app.Version
             return _sv_access_app
         except Exception:
             _sv_access_app = None
 
+    # Fallback: scan the Running Object Table for all Access instances.
     try:
         import win32com.client
         ctx  = pythoncom.CreateBindCtx(0)
@@ -252,7 +262,8 @@ def _get_access_app():
         pass
 
     # Last resort.
-    try:        return win32com.client.GetActiveObject("Access.Application")
+    try:
+        return win32com.client.GetActiveObject("Access.Application")
     except Exception:
         return None
 
@@ -310,7 +321,10 @@ def _find_sfdoc(form):
 # GUI insertion
 def _insert_via_com(patient: dict, relative_path: str, description: str) -> bool:
     """
-    Inserts a new record into the SFDoc subform via COM automation.
+    Inserts a new record into the SFDoc subform via win32com GUI automation.
+
+    Fields written (mirrors the original SQL INSERT):
+      code patient, Date, DESCRIPTIONS, TEXTE, Photo externe, TypeVW=99
     Returns True on success, False on any COM error.
     """
     try:
@@ -324,6 +338,7 @@ def _insert_via_com(patient: dict, relative_path: str, description: str) -> bool
             log.error("COM insert failed: no active Access form.")
             return False
 
+        # Safety check: make sure the right patient is still open.
         current = get_active_patient()
         if not current or current["code"] != patient["code"]:
             log.warning(
@@ -739,7 +754,7 @@ def _launch_studio_vision() -> None:
         return
 
 
-    # Bind COM Access.Application to the correct instance.
+    # Bind COM Access.Application to the correct instance (this PID, not the other one).
     global _sv_access_app
     try:
         import win32com.client as _wcc

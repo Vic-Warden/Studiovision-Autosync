@@ -833,26 +833,6 @@ def main() -> None:
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 
-    # Prevent manual restart while Studio Vision is running
-    try:
-        parent_name = psutil.Process(os.getpid()).parent().name().lower()
-    except Exception:
-        parent_name = ""
-
-    if parent_name == "explorer.exe":
-        sv_running = any(
-            (p.info["name"] or "").lower() == "msaccess.exe"
-            for p in psutil.process_iter(["name"])
-        )
-        if sv_running:
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "To restart the image router, please fully close and relaunch Studio Vision.",
-                "Image Router HR",
-                0x30,
-            )
-            sys.exit(0)
-
     prevent_sleep()
 
     if not SOURCE_DIR.exists():

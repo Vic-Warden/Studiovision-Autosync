@@ -222,6 +222,55 @@ def _resolve_patient_folder(code: str, nom: str, prenom: str) -> "Path | None":
 
 # Access COM — read active patient
 
+def get_active_patient() -> dict | None:
+    """
+    Reads Code patient / NOM / Prénom from the active fPATIENTS form.
+    Field names confirmed by COM diagnostic:
+      [7] BoundObjectFrame  Name='Code patient'
+      [8] BoundObjectFrame  Name='NOM'
+      [9] BoundObjectFrame  Name='Prénom'
+    Returns dict(code, nom, prenom) or None if unavailable.
+    """
+    try:
+        access = _get_access_app()
+        if access is None:
+            return None
+        form = access.Screen.ActiveForm
+        if form is None:
+            return None
+
+        data = {}
+        target = {ACCESS_FIELD_CODE, ACCESS_FIELD_NOM, ACCESS_FIELD_PRENOM}
+
+        for i in range(form.Controls.Count):
+            try:
+                ctrl = form.Controls(i)
+                name = str(ctrl.Name)
+                if name in target:
+                    data[name] = ctrl.Value
+            except Exception:
+                pass
+
+        if not target.issubset(data.keys()):
+            return None
+
+        code   = data[ACCESS_FIELD_CODE]
+        nom    = data[ACCESS_FIELD_NOM]
+        prenom = data[ACCESS_FIELD_PRENOM]
+
+        if code is None or nom is None or prenom is None:
+            return None
+
+        return {
+            "code":   str(code).strip(),
+            "nom":    str(nom).strip(),
+            "prenom": str(prenom).strip(),
+        }
+    except Exception as exc:
+        log.debug(f"get_active_patient error: {exc}")
+        return None
+
+
 def _get_access_app():
     """
     Returns the Access.Application COM object for THIS specific instance.
@@ -321,7 +370,7 @@ def _insert_via_com(patient: dict, relative_path: str, description: str) -> bool
         from datetime import datetime as _dt
         _set("code patient",  int(patient["code"]))
         _set("Date",          _dt.now())
-        _set("DESCRIPTIONS",  description)
+        _set("Description",   description)
         _set("TEXTE",         relative_path)
         _set("Photo externe", relative_path)
         _set("TypeVW",        99)

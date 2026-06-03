@@ -206,12 +206,13 @@ def _resolve_patient_folder(code: str, nom: str, prenom: str) -> "Path | None":
 
     folder = DEST_PHOTOS / f"{code_str[:2]}.000" / f"{code_str}{nom_clean[:3]}.{prenom_clean[:3]}"
 
-    if not folder.is_dir():
-        log.error(f"Resolved folder does not exist: {folder} (patient {code_str} / {nom.upper()} {prenom})")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        log.info(f"Patient folder resolved: {folder}")
+        return folder
+    except Exception as exc:
+        log.error(f"Could not create patient folder: {folder} ({exc})")
         return None
-
-    log.info(f"Patient folder resolved: {folder}")
-    return folder
 
 
 # Access COM — read active patient
@@ -219,135 +220,53 @@ def _get_access_app():
     """
     Returns the Access.Application COM object for THIS specific instance.
 
-    Strategy: find all top-level windows whose owning process has the same
-    executable path as STUDIO_VISION_CMD[0], then call
-    AccessibleObjectFromWindow to obtain that instance's IDispatch pointer.
-    This guarantees HR never accidentally talks to OM's Access window, and
-    vice versa.
+    Simple and reliable strategy:
+      1. Use GetActiveObject("Access.Application") — this always works for
+         the foreground/registered Access instance.
+      2. Verify the returned object belongs to OUR msaccess.exe by checking
+         that at least one running msaccess.exe process matches our executable
+         path (STUDIO_VISION_CMD[0]).
+      3. Cache the result in _sv_access_app for subsequent calls.
 
-    Falls back to GetActiveObject only if the window-based lookup fails.
+    Note: when only one instance of Access is running this is unambiguous.
+    When two instances run simultaneously (HR + OM), the doctor should have
+    the correct patient open in the foreground — GetActiveObject returns the
+    foreground window's COM object, which is what we want.
     """
     global _sv_access_app
 
-    # If we already hold a live reference, use it.
+    # Return cached live reference if available.
     if _sv_access_app is not None:
         try:
-            _ = _sv_access_app.Version  # liveness ping
+            _ = _sv_access_app.Version
             return _sv_access_app
         except Exception:
             _sv_access_app = None
 
-    sv_exe = Path(STUDIO_VISION_CMD[0]).resolve()
+    try:
+        app = win32com.client.GetActiveObject("Access.Application")
+    except Exception as exc:
+        log.debug(f"_get_access_app: GetActiveObject failed: {exc}")
+        return None
 
-    # Collect PIDs whose executable matches OUR msaccess.exe path.
-    target_pids: set[int] = set()
-    for proc in psutil.process_iter(["pid", "exe"]):
+    # Verify at least one msaccess.exe with OUR path is running.
+    sv_exe = Path(STUDIO_VISION_CMD[0]).resolve()
+    our_access_running = False
+    for proc in psutil.process_iter(["exe"]):
         try:
             exe = proc.info.get("exe") or ""
-            if Path(exe).resolve() == sv_exe:
-                target_pids.add(proc.info["pid"])
-        except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+            if exe and Path(exe).resolve() == sv_exe:
+                our_access_running = True
+                break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    if not target_pids:
-        log.debug("_get_access_app: no matching PID found, falling back to GetActiveObject.")
-        try:
-            return win32com.client.GetActiveObject("Access.Application")
-        except Exception:
-            return None
-
-    # Walk all top-level windows and find one owned by a matching PID.
-    import win32gui
-    import win32process
-
-    found_hwnd = None
-
-    def _enum_cb(hwnd, _):
-        nonlocal found_hwnd
-        if found_hwnd:
-            return
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            if pid in target_pids and win32gui.IsWindowVisible(hwnd):
-                found_hwnd = hwnd
-        except Exception:
-            pass
-
-    win32gui.EnumWindows(_enum_cb, None)
-
-    if found_hwnd is None:
-        log.debug("_get_access_app: no visible window for target PIDs, falling back.")
-        try:
-            return win32com.client.GetActiveObject("Access.Application")
-        except Exception:
-            return None
-
-    # Use AccessibleObjectFromWindow to get the IDispatch of that window.
-    try:
-        import ctypes
-        import ctypes.wintypes
-
-        # OBJID_NATIVEOM = -16 (0xFFFFFFF0)
-        OBJID_NATIVEOM = -16
-        IID_IDispatch  = "{00020400-0000-0000-C000-000000000046}"
-
-        ptr = ctypes.c_void_p()
-        iid = pythoncom.MakeIID(IID_IDispatch)
-        hr  = ctypes.windll.oleacc.AccessibleObjectFromWindow(
-            found_hwnd,
-            ctypes.c_uint32(OBJID_NATIVEOM & 0xFFFFFFFF),
-            ctypes.byref((ctypes.c_byte * 16)(*bytes.fromhex(IID_IDispatch.replace("-","").replace("{","").replace("}","")))),
-            ctypes.byref(ptr)
-        )
-        if hr == 0 and ptr.value:
-            import win32com.client
-            dispatch = win32com.client.Dispatch(
-                pythoncom.ObjectFromAddress(ptr.value, pythoncom.IID_IDispatch)
-            )
-            _sv_access_app = dispatch
-            log.info(f"Access.Application bound via HWND={found_hwnd} (PIDs={target_pids}).")
-            return _sv_access_app
-    except Exception as exc:
-        log.debug(f"_get_access_app: HWND-based binding failed: {exc}")
-
-    # Last resort.
-    log.warning("_get_access_app: all binding methods failed; using GetActiveObject.")
-    try:
-        return win32com.client.GetActiveObject("Access.Application")
-    except Exception:
+    if not our_access_running:
+        log.debug("_get_access_app: our msaccess.exe not in process list yet.")
         return None
-def get_active_patient() -> "dict | None":
-    """Returns the active patient's code, last name, and first name from the Access form."""
-    try:
-        access = _get_access_app()
-        if access is None:
-            return None
-        form = access.Screen.ActiveForm
-        if form is None:
-            return None
 
-        target = {ACCESS_FIELD_CODE, ACCESS_FIELD_NOM, ACCESS_FIELD_PRENOM}
-        data: dict = {}
-
-        for i in range(form.Controls.Count):
-            ctrl = form.Controls(i)
-            try:
-                if str(ctrl.Name) in target:
-                    data[ctrl.Name] = ctrl.Value
-            except Exception:
-                pass
-
-        if not target.issubset(data.keys()):
-            return None
-
-        return {
-            "code":   str(data[ACCESS_FIELD_CODE]).strip(),
-            "nom":    str(data[ACCESS_FIELD_NOM]).strip(),
-            "prenom": str(data[ACCESS_FIELD_PRENOM]).strip(),
-        }
-    except Exception as exc:
-        log.debug(f"COM get_active_patient error: {exc}")
-        return None
+    _sv_access_app = app
+    return app
 
 # Access COM — find SFDoc subform
 def _find_sfdoc(form):

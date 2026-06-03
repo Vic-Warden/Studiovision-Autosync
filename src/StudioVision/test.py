@@ -1,148 +1,58 @@
-"""
-diagnostic_access.py
-====================
-Run this script WHILE Studio Vision is open and a patient is displayed.
-It dumps every control name/value visible in the active form and all
-subforms, so we can find exactly where Code patient / NOM / Prénom live.
-
-Usage:
-    python diagnostic_access.py
-    (or double-click it — output goes to diagnostic_output.txt on the Desktop)
-"""
-
-import os
+import win32com.client
+import pythoncom
 import sys
-from pathlib import Path
 
-try:
-    import pythoncom
-    import win32com.client
-except ImportError:
-    input("ERROR: pywin32 not installed. Press Enter to exit.")
-    sys.exit(1)
-
-OUTPUT_FILE = Path(os.path.expanduser("~")) / "Desktop" / "diagnostic_output.txt"
-lines = []
-
-def p(text=""):
-    print(text)
-    lines.append(text)
-
-
-def dump_controls(form, depth=0):
-    indent = "  " * depth
-    try:
-        count = form.Controls.Count
-    except Exception as e:
-        p(f"{indent}[Cannot read controls: {e}]")
-        return
-
-    for i in range(count):
-        try:
-            ctrl = form.Controls(i)
-        except Exception as e:
-            p(f"{indent}[Control {i} error: {e}]")
-            continue
-
-        try:
-            name = str(ctrl.Name)
-        except Exception:
-            name = f"<control_{i}>"
-
-        try:
-            ctrl_type = int(ctrl.ControlType)
-        except Exception:
-            ctrl_type = -1
-
-        try:
-            value = repr(ctrl.Value)
-        except Exception:
-            value = "<no value>"
-
-        # ControlType 112 = subform, 109 = text box, 110 = label, etc.
-        type_name = {
-            100: "Label", 101: "Rectangle", 102: "Line", 103: "Image",
-            104: "CommandButton", 105: "ToggleButton", 106: "OptionButton",
-            107: "CheckBox", 108: "OptionGroup", 109: "BoundObjectFrame",
-            110: "TextBox", 111: "ListBox", 112: "SubForm", 113: "ComboBox",
-            114: "ObjectFrame", 118: "PageBreak", 119: "CustomControl",
-            122: "Attachment", 123: "NavigationControl",
-        }.get(ctrl_type, f"Type{ctrl_type}")
-
-        p(f"{indent}[{i}] {type_name:<15} Name={name!r:<40} Value={value}")
-
-        # Recurse into subforms
-        if ctrl_type == 112:
-            p(f"{indent}  >>> Entering subform: {name!r}")
-            try:
-                dump_controls(ctrl.Form, depth + 2)
-            except Exception as e:
-                p(f"{indent}  [Subform error: {e}]")
-            p(f"{indent}  <<< End subform: {name!r}")
-
-
-def main():
+def fill_refraction_form():
+    # Initialisation de COM
     pythoncom.CoInitialize()
-
-    p("=" * 70)
-    p("Studio Vision — Access COM Diagnostic")
-    p("=" * 70)
-    p()
-
+    
+    print("Tentative de connexion à Studio Vision (Access)...")
     try:
+        # Se connecter à l'instance Access déjà ouverte
         access = win32com.client.GetActiveObject("Access.Application")
-        p(f"Access version : {access.Version}")
-        p(f"Access visible : {access.Visible}")
-        p()
     except Exception as e:
-        p(f"ERROR: Cannot connect to Access.Application: {e}")
-        p()
-        p("Make sure Studio Vision is open and a patient record is displayed.")
-        _save_and_exit()
-        return
-
+        print(f"❌ Erreur de connexion. Assurez-vous que Studio Vision est ouvert. Détails: {e}")
+        sys.exit(1)
+        
     try:
-        form = access.Screen.ActiveForm
-        if form is None:
-            p("ERROR: access.Screen.ActiveForm is None — no form is active.")
-            p("Click on the patient form in Studio Vision and run again.")
-            _save_and_exit()
-            return
-        p(f"Active form name : {form.Name!r}")
-        p(f"Active form caption : {getattr(form, 'Caption', '?')!r}")
-        p()
+        # Cibler spécifiquement le formulaire de réfraction
+        form = access.Forms("REFRACTION")
+        print(f"✅ Formulaire '{form.Name}' trouvé !")
     except Exception as e:
-        p(f"ERROR reading ActiveForm: {e}")
-        _save_and_exit()
-        return
+        print("❌ Le formulaire 'REFRACTION' n'est pas ouvert ou n'est pas accessible.")
+        sys.exit(1)
 
-    p("--- All controls (recursing into subforms) ---")
-    p()
-    dump_controls(form)
+    # Dictionnaire des valeurs à remplir. 
+    # Remplace les chaînes de caractères par les vraies valeurs cliniques à tester.
+    valeurs_a_injecter = {
+        "TOD": "14",           # Tension OD
+        "Champ31": "15",       # Tension OG (Nommé Champ31 dans ton Access)
+        "SPHERE OD": "+1.25",  
+        "SPHERE OG": "+1.50",
+        "CYLINDRE OD": "-0.25",
+        "CYLINDRE OG": "-0.50",
+        "AXE OD": "90",
+        "AXE OG": "85",
+        "AVL OD": "10",        # Acuité visuelle de loin
+        "AVL OG": "10",
+        "ADD OD": "2.50",      # Addition
+        "ADD OG": "2.50",
+        "AVP OD": "P2",        # Parinaud
+        "AVP OG": "P2",
+        "Binoc": "10"
+    }
 
-    p()
-    p("=" * 70)
-    p("Diagnostic complete.")
-    p(f"Output saved to: {OUTPUT_FILE}")
+    print("\n--- Début du remplissage ---")
+    # Boucle d'injection
+    for nom_champ, nouvelle_valeur in valeurs_a_injecter.items():
+        try:
+            # On assigne la nouvelle valeur au contrôle correspondant
+            form.Controls(nom_champ).Value = nouvelle_valeur
+            print(f"  [OK] {nom_champ:<12} -> {nouvelle_valeur}")
+        except Exception as e:
+            print(f"  [Erreur] Impossible de remplir '{nom_champ}' : {e}")
 
-    _save_and_exit()
-
-
-def _save_and_exit():
-    text = "\n".join(lines)
-    try:
-        OUTPUT_FILE.write_text(text, encoding="utf-8")
-        print(f"\nSaved to {OUTPUT_FILE}")
-    except Exception as e:
-        print(f"Could not save file: {e}")
-
-    try:
-        os.startfile(str(OUTPUT_FILE))
-    except Exception:
-        pass
-
-    input("\nPress Enter to close...")
-
+    print("--- Remplissage terminé ---")
 
 if __name__ == "__main__":
-    main()
+    fill_refraction_form()

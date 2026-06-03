@@ -217,56 +217,105 @@ def _resolve_patient_folder(code: str, nom: str, prenom: str) -> "Path | None":
 # Access COM — read active patient
 def _get_access_app():
     """
-    Returns the correct Access.Application COM object for THIS instance.
+    Returns the Access.Application COM object for THIS specific instance.
 
-    When two msaccess.exe processes run simultaneously (HR + OM on same PC),
-    GetActiveObject("Access.Application") always returns the first one registered
-    in the ROT (Running Object Table) — which may be the wrong instance.
+    Strategy: find all top-level windows whose owning process has the same
+    executable path as STUDIO_VISION_CMD[0], then call
+    AccessibleObjectFromWindow to obtain that instance's IDispatch pointer.
+    This guarantees HR never accidentally talks to OM's Access window, and
+    vice versa.
 
-    Instead we iterate every Access.Application entry in the ROT and match by
-    the PID of the msaccess.exe process we launched ourselves (_sv_access_app
-    is set by _launch_studio_vision as soon as the PID is known).
-
-    Falls back to GetActiveObject if the bound app is unavailable.
+    Falls back to GetActiveObject only if the window-based lookup fails.
     """
     global _sv_access_app
+
+    # If we already hold a live reference, use it.
     if _sv_access_app is not None:
         try:
-            # Quick liveness check — if it raises, the app has gone away.
-            _ = _sv_access_app.Version
+            _ = _sv_access_app.Version  # liveness ping
             return _sv_access_app
         except Exception:
             _sv_access_app = None
 
-    # Fallback: scan the Running Object Table for all Access instances.
+    sv_exe = Path(STUDIO_VISION_CMD[0]).resolve()
+
+    # Collect PIDs whose executable matches OUR msaccess.exe path.
+    target_pids: set[int] = set()
+    for proc in psutil.process_iter(["pid", "exe"]):
+        try:
+            exe = proc.info.get("exe") or ""
+            if Path(exe).resolve() == sv_exe:
+                target_pids.add(proc.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+            pass
+
+    if not target_pids:
+        log.debug("_get_access_app: no matching PID found, falling back to GetActiveObject.")
+        try:
+            return win32com.client.GetActiveObject("Access.Application")
+        except Exception:
+            return None
+
+    # Walk all top-level windows and find one owned by a matching PID.
+    import win32gui
+    import win32process
+
+    found_hwnd = None
+
+    def _enum_cb(hwnd, _):
+        nonlocal found_hwnd
+        if found_hwnd:
+            return
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid in target_pids and win32gui.IsWindowVisible(hwnd):
+                found_hwnd = hwnd
+        except Exception:
+            pass
+
+    win32gui.EnumWindows(_enum_cb, None)
+
+    if found_hwnd is None:
+        log.debug("_get_access_app: no visible window for target PIDs, falling back.")
+        try:
+            return win32com.client.GetActiveObject("Access.Application")
+        except Exception:
+            return None
+
+    # Use AccessibleObjectFromWindow to get the IDispatch of that window.
     try:
-        import win32com.client
-        ctx  = pythoncom.CreateBindCtx(0)
-        rot  = pythoncom.GetRunningObjectTable()
-        enum = rot.EnumRunning()
-        while True:
-            monikers = enum.Next(10)
-            if not monikers:
-                break
-            for mk in monikers:
-                try:
-                    name = mk.GetDisplayName(ctx, None)
-                    if "Access" not in name:
-                        continue
-                    obj = rot.GetObject(mk)
-                    app = win32com.client.Dispatch(obj.QueryInterface(pythoncom.IID_IDispatch))
-                    return app
-                except Exception:
-                    pass
-    except Exception:
-        pass
+        import ctypes
+        import ctypes.wintypes
+
+        # OBJID_NATIVEOM = -16 (0xFFFFFFF0)
+        OBJID_NATIVEOM = -16
+        IID_IDispatch  = "{00020400-0000-0000-C000-000000000046}"
+
+        ptr = ctypes.c_void_p()
+        iid = pythoncom.MakeIID(IID_IDispatch)
+        hr  = ctypes.windll.oleacc.AccessibleObjectFromWindow(
+            found_hwnd,
+            ctypes.c_uint32(OBJID_NATIVEOM & 0xFFFFFFFF),
+            ctypes.byref((ctypes.c_byte * 16)(*bytes.fromhex(IID_IDispatch.replace("-","").replace("{","").replace("}","")))),
+            ctypes.byref(ptr)
+        )
+        if hr == 0 and ptr.value:
+            import win32com.client
+            dispatch = win32com.client.Dispatch(
+                pythoncom.ObjectFromAddress(ptr.value, pythoncom.IID_IDispatch)
+            )
+            _sv_access_app = dispatch
+            log.info(f"Access.Application bound via HWND={found_hwnd} (PIDs={target_pids}).")
+            return _sv_access_app
+    except Exception as exc:
+        log.debug(f"_get_access_app: HWND-based binding failed: {exc}")
 
     # Last resort.
+    log.warning("_get_access_app: all binding methods failed; using GetActiveObject.")
     try:
         return win32com.client.GetActiveObject("Access.Application")
     except Exception:
         return None
-
 def get_active_patient() -> "dict | None":
     """Returns the active patient's code, last name, and first name from the Access form."""
     try:
@@ -754,39 +803,6 @@ def _launch_studio_vision() -> None:
             log.error("msaccess.exe did not appear. Shutting down.")
             _stop_event.set()
         return
-
-
-    # Bind COM Access.Application to the correct instance (this PID, not the other one).
-    global _sv_access_app
-    try:
-        import win32com.client as _wcc
-        import pythoncom as _pycom
-        _new_pids = sorted(_get_msaccess_pids() - pids_before)
-        ctx  = _pycom.CreateBindCtx(0)
-        rot  = _pycom.GetRunningObjectTable()
-        enum = rot.EnumRunning()
-        _bound = False
-        while not _bound:
-            mks = enum.Next(10)
-            if not mks:
-                break
-            for mk in mks:
-                try:
-                    name = mk.GetDisplayName(ctx, None)
-                    if "Access" not in name:
-                        continue
-                    obj = rot.GetObject(mk)
-                    app = _wcc.Dispatch(obj.QueryInterface(_pycom.IID_IDispatch))
-                    _sv_access_app = app
-                    log.info(f"COM Access.Application bound to this instance (PIDs={_new_pids}).")
-                    _bound = True
-                    break
-                except Exception:
-                    pass
-        if not _bound:
-            log.warning("Could not bind COM app to specific PID; will use GetActiveObject fallback.")
-    except Exception as e:
-        log.warning(f"COM binding failed: {e}")
 
     consecutive_empty = 0
     _EMPTY_THRESHOLD  = 2

@@ -725,6 +725,8 @@ def _launch_studio_vision() -> None:
     Handles the /runtime 2-stage relay by diffing PIDs before/after launch.
     Force-kills tracked processes on exit to release COM locks.
     """
+    # COM must be initialised on every thread that uses win32com.
+    pythoncom.CoInitialize()
     log.info(f"Launching Studio Vision: {' '.join(STUDIO_VISION_CMD)}")
     pids_before: set[int] = _get_msaccess_pids()
 
@@ -817,6 +819,7 @@ def _launch_studio_vision() -> None:
                 pass
 
         _stop_event.set()
+        pythoncom.CoUninitialize()
         if _icon is not None:
             try:
                 _icon.stop()

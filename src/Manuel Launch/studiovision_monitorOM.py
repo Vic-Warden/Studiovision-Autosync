@@ -124,6 +124,7 @@ _icon:         "pystray.Icon | None" = None
 _status_text:  str                   = "Starting..."
 _stop_event:   threading.Event       = threading.Event()
 _mutex_handle                        = None
+_sv_access_app = None  # COM Access.Application bound to the PID we launched
 
 _ICON_SIZE    = 64
 _COLOR_READY  = (30, 144, 255)
@@ -220,11 +221,57 @@ def _resolve_patient_folder(code: str, nom: str, prenom: str) -> "Path | None":
 
 # Access COM — read active patient
 
-def get_active_patient() -> dict | None:
-    """Reads patient identity fields from the currently open Access form."""
+def _get_access_app():
+    """
+    Returns the Access.Application COM object bound to this instance.
+    Scans the ROT to avoid returning the wrong instance when multiple
+    msaccess.exe processes are running. Falls back to GetActiveObject.
+    """
+    global _sv_access_app
+    if _sv_access_app is not None:
+        try:
+            # Quick liveness check — if it raises, the app has gone away.
+            _ = _sv_access_app.Version
+            return _sv_access_app
+        except Exception:
+            _sv_access_app = None
+
+    # Fallback: scan the Running Object Table for all Access instances.
     try:
-        access = win32com.client.GetActiveObject("Access.Application")
-        form   = access.Screen.ActiveForm
+        import win32com.client
+        ctx  = pythoncom.CreateBindCtx(0)
+        rot  = pythoncom.GetRunningObjectTable()
+        enum = rot.EnumRunning()
+        while True:
+            monikers = enum.Next(10)
+            if not monikers:
+                break
+            for mk in monikers:
+                try:
+                    name = mk.GetDisplayName(ctx, None)
+                    if "Access" not in name:
+                        continue
+                    obj = rot.GetObject(mk)
+                    app = win32com.client.Dispatch(obj.QueryInterface(pythoncom.IID_IDispatch))
+                    return app
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Last resort.
+    try:
+        return win32com.client.GetActiveObject("Access.Application")
+    except Exception:
+        return None
+
+def get_active_patient() -> dict | None:
+    """Returns the active patient's code, last name, and first name from the Access form."""
+    try:
+        access = _get_access_app()
+        if access is None:
+            return None
+        form = access.Screen.ActiveForm
         if form is None:
             return None
 
@@ -247,12 +294,9 @@ def get_active_patient() -> dict | None:
             "nom":    str(data[ACCESS_FIELD_NOM]).strip(),
             "prenom": str(data[ACCESS_FIELD_PRENOM]).strip(),
         }
-
     except Exception as exc:
         log.debug(f"COM get_active_patient error: {exc}")
         return None
-
-
 def _find_sfdoc(form):
     """Recursively searches the form's control tree for the SFDoc subform."""
     for i in range(form.Controls.Count):
@@ -273,16 +317,27 @@ def _find_sfdoc(form):
 # GUI insertion
 def _insert_via_com(patient: dict, relative_path: str, description: str) -> bool:
     """
-    Inserts a new record into the SFDoc subform via win32com GUI automation.
-    Calls AddNew(), fills 'Photo externe' and 'TEXTE', calls Update(),
-    then Requery() (with retries) + MoveLast() to refresh the UI.
+    Inserts a new record into the SFDoc subform via COM automation.
     Returns True on success, False on any COM error.
     """
     try:
-        access = win32com.client.GetActiveObject("Access.Application")
-        form   = access.Screen.ActiveForm
+        access = _get_access_app()
+        if access is None:
+            log.error("COM insert failed: could not obtain Access.Application.")
+            return False
+
+        form = access.Screen.ActiveForm
         if form is None:
             log.error("COM insert failed: no active Access form.")
+            return False
+
+        current = get_active_patient()
+        if not current or current["code"] != patient["code"]:
+            log.warning(
+                f"COM insert aborted: patient changed "
+                f"(expected={patient['code']}, "
+                f"current={current['code'] if current else 'none'})."
+            )
             return False
 
         sfdoc = _find_sfdoc(form)
@@ -292,12 +347,31 @@ def _insert_via_com(patient: dict, relative_path: str, description: str) -> bool
 
         rs = sfdoc.Recordset
         rs.AddNew()
-        rs.Fields("Photo externe").Value = relative_path
-        rs.Fields("TEXTE").Value         = relative_path
-        rs.Update()
-        log.info(f"COM insert OK: patient={patient['code']} path='{relative_path}' desc='{description}'")
 
-        # Allow ACE engine to finalise the write before Requery
+        def _set(name, value):
+            try:
+                rs.Fields(name).Value = value
+            except Exception as e:
+                log.warning(f"  Field '{name}' write failed: {e}")
+
+        from datetime import datetime as _dt
+        _set("code patient",  int(patient["code"]))
+        _set("Date",          _dt.now())
+        _set("DESCRIPTIONS",  description)
+        _set("TEXTE",         relative_path)
+        _set("Photo externe", relative_path)
+        _set("TypeVW",        99)
+        try:
+            rs.Fields("NumDocExterne").Value = None
+        except Exception:
+            pass
+
+        rs.Update()
+        log.info(
+            f"COM insert OK: patient={patient['code']} "
+            f"path='{relative_path}' desc='{description}'"
+        )
+
         time.sleep(0.5)
 
         requery_ok = False
@@ -313,23 +387,23 @@ def _insert_via_com(patient: dict, relative_path: str, description: str) -> bool
                     time.sleep(0.5)
 
         if not requery_ok:
-            log.warning(f"All Requery() attempts failed on '{SFDOC_SUBFORM_NAME}'; falling back to Refresh().")
+            log.warning(f"All Requery() attempts failed; falling back to Refresh().")
             try:
                 sfdoc.Refresh()
+                log.info("Fallback Refresh() OK.")
             except Exception as exc_ref:
                 log.warning(f"Fallback Refresh() also failed: {exc_ref}")
 
         try:
             sfdoc.Recordset.MoveLast()
-        except Exception as exc_ml:
-            log.debug(f"MoveLast() failed: {exc_ml}")
+        except Exception:
+            pass
 
         return True
 
     except Exception as exc:
         log.error(f"COM insert/refresh failed: {exc}")
         return False
-
 
 # File utilities
 def wait_for_file(file: Path) -> bool:
@@ -689,6 +763,39 @@ def _launch_studio_vision() -> None:
             _stop_event.set()
         return
 
+
+    # Bind COM Access.Application to the correct instance.
+    global _sv_access_app
+    try:
+        import win32com.client as _wcc
+        import pythoncom as _pycom
+        _new_pids = sorted(_get_msaccess_pids() - pids_before)
+        ctx  = _pycom.CreateBindCtx(0)
+        rot  = _pycom.GetRunningObjectTable()
+        enum = rot.EnumRunning()
+        _bound = False
+        while not _bound:
+            mks = enum.Next(10)
+            if not mks:
+                break
+            for mk in mks:
+                try:
+                    name = mk.GetDisplayName(ctx, None)
+                    if "Access" not in name:
+                        continue
+                    obj = rot.GetObject(mk)
+                    app = _wcc.Dispatch(obj.QueryInterface(_pycom.IID_IDispatch))
+                    _sv_access_app = app
+                    log.info(f"COM Access.Application bound to this instance (PIDs={_new_pids}).")
+                    _bound = True
+                    break
+                except Exception:
+                    pass
+        if not _bound:
+            log.warning("Could not bind COM app to specific PID; will use GetActiveObject fallback.")
+    except Exception as e:
+        log.warning(f"COM binding failed: {e}")
+
     consecutive_empty = 0
     _EMPTY_THRESHOLD  = 2
     tracked_pids: set[int] = set()
@@ -740,6 +847,26 @@ def main() -> None:
     )
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
+
+    # Prevent manual restart while Studio Vision is running
+    try:
+        parent_name = psutil.Process(os.getpid()).parent().name().lower()
+    except Exception:
+        parent_name = ""
+
+    if parent_name == "explorer.exe":
+        sv_running = any(
+            (p.info["name"] or "").lower() == "msaccess.exe"
+            for p in psutil.process_iter(["name"])
+        )
+        if sv_running:
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "To restart the image router, please fully close and relaunch Studio Vision.",
+                "Image Router OM",
+                0x30,
+            )
+            sys.exit(0)
 
     prevent_sleep()
 

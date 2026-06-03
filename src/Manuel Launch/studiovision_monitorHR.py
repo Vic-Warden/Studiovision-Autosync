@@ -244,7 +244,7 @@ def _get_access_app():
             _sv_access_app = None
 
     try:
-        app = win32com.client.GetActiveObject("Access.Application")
+        app = win32com.client.GetObject(r"C:\Studiov2000\svprog\Ophprog.mde").Application
     except Exception as exc:
         log.debug(f"_get_access_app: GetActiveObject failed: {exc}")
         return None

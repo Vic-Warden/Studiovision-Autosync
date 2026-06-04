@@ -13,7 +13,7 @@ def fill_refraction_form():
     except Exception as e:
         print(f"❌ Erreur de connexion. Assurez-vous que Studio Vision est ouvert. Détails: {e}")
         sys.exit(1)
-        
+
     try:
         # Cibler spécifiquement le formulaire de réfraction
         form = access.Forms("REFRACTION")

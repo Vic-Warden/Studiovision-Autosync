@@ -24,21 +24,18 @@ try:
 except ImportError:
     TRAY_AVAILABLE = False
 
-# ==========================================
-# CONFIGURATION DES LOGS
-# ==========================================
-# Crée un fichier fronto.log dans le dossier courant et affiche aussi dans la console
+# Logging — writes to fronto.log and stdout
 logging.basicConfig(
-    level=logging.DEBUG, # DEBUG permet de tout voir. Mettre INFO en production.
+    level=logging.DEBUG,  # Use INFO in production
     format="%(asctime)s [%(levelname)-8s] %(threadName)-15s: %(message)s",
     handlers=[
         logging.FileHandler("fronto.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 logger = logging.getLogger("Fronto")
 
-# Configuration globale
+# Configuration
 APP_NAME    = "Fronto"
 SERIAL_PORT = "COM6"
 BAUD_RATE   = 9600
@@ -58,24 +55,28 @@ STUDIO_VISION_CMD = [
     "demarrage",
 ]
 
-_SV_POLL_INTERVAL   = 3
-_SV_STARTUP_TIMEOUT = 30
+_SV_POLL_INTERVAL   = 3   # Seconds between msaccess.exe alive checks
+_SV_STARTUP_TIMEOUT = 30  # Seconds to wait for msaccess.exe to appear
 
-_stop_event   = threading.Event()
-_icon         = None
-_status_text  = "Starting..."
+# Global state
+_stop_event  = threading.Event()
+_icon        = None
+_status_text = "Starting..."
 
 _ICON_SIZE    = 64
 _COLOR_READY  = (30, 144, 255)
 _COLOR_ACTIVE = (50, 205, 50)
 _COLOR_ERROR  = (220, 50, 50)
 
+
+# System tray helpers
 def _make_icon(color):
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     margin = 4
     draw.ellipse([margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin], fill=color)
     return img
+
 
 def _set_status(text, color=None):
     global _status_text
@@ -86,105 +87,116 @@ def _set_status(text, color=None):
                 _icon.icon = _make_icon(color)
             _icon.update_menu()
         except Exception as e:
-            logger.debug(f"Erreur update icône: {e}")
+            logger.debug("Tray update failed: %s", e)
+
 
 def _notify(title, message=""):
     if _icon is not None:
         try:
             _icon.notify(message if message else title, title)
         except Exception as e:
-            logger.debug(f"Erreur notification: {e}")
+            logger.debug("Notification failed: %s", e)
+
 
 def _quit(icon, item):
-    logger.info("Fermeture demandée via l'icône de la barre des tâches.")
+    logger.info("Quit requested from tray menu.")
     _stop_event.set()
     icon.stop()
 
+
 def parse_trame(line):
     # type: (str) -> Optional[Dict[str, str]]
+    """
+    Parses a refractometer serial frame.
+    Examples:
+      [01]RSPH=-11.25;CYL=-02.50;AXS=028;AD1=+01.75;Phx=+31.27;[17]
+      [02]LSPH=-12.50;CYL=-01.00;AXS=148;AD1=+03.50;Phx=+32.46;IDP=43288;[17]
+    Returns a dict with 'eye' ('OD' or 'OG') and parsed values, or None.
+    """
     line = line.strip()
-    logger.debug(f"Analyse de la ligne brute : '{line}'")
+    logger.debug("Parsing frame: '%s'", line)
 
+    # [01] = right eye (OD), [02] = left eye (OG)
     eye_match = re.match(r'^\[0([12])\]', line)
     if not eye_match:
-        logger.warning("-> Format d'œil non reconnu (ne commence pas par [01] ou [02]). Ignoré.")
+        logger.warning("Unrecognised eye prefix — expected [01] or [02]. Skipping.")
         return None
-    
+
     eye = "OD" if eye_match.group(1) == "1" else "OG"
     result = {"eye": eye}
-    logger.debug(f"-> Œil détecté : {eye}")
+    logger.debug("Eye detected: %s", eye)
 
     m = re.search(r'[RL]SPH=([+-]?\d+\.\d+)', line)
     if m:
         result["SPH"] = m.group(1)
-        logger.debug(f"-> Sphère trouvée : {result['SPH']}")
 
     m = re.search(r'CYL=([+-]?\d+\.\d+)', line)
     if m:
         result["CYL"] = m.group(1)
-        logger.debug(f"-> Cylindre trouvé : {result['CYL']}")
 
     m = re.search(r'AXS=(\d+)', line)
     if m:
-        result["AXS"] = str(int(m.group(1)))
-        logger.debug(f"-> Axe trouvé : {result['AXS']}")
+        result["AXS"] = str(int(m.group(1)))  # strip leading zeros
 
     m = re.search(r'AD1=([+-]?\d+\.\d+)', line)
     if m:
         result["ADD"] = m.group(1)
-        logger.debug(f"-> Addition trouvée : {result['ADD']}")
 
     if len(result) > 1:
-        logger.info(f"Trame décodée avec succès : {result}")
+        logger.info("Frame decoded: %s", result)
         return result
     else:
-        logger.warning("-> Aucune valeur clinique (SPH, CYL, AXS, ADD) trouvée dans la ligne.")
+        logger.warning("No clinical values (SPH, CYL, AXS, ADD) found in frame.")
         return None
+
 
 def inject_into_access(data):
     # type: (Dict[str, str]) -> None
-    logger.info("Début de l'injection COM dans Access...")
+    """Injects parsed refractometer values into the REFRACTION form in Access."""
+    logger.info("Injecting into Access...")
     pythoncom.CoInitialize()
     try:
         access = win32com.client.GetActiveObject("Access.Application")
     except Exception as e:
-        logger.error(f"Impossible de se connecter à StudioVision via COM: {e}")
-        _set_status(f"{APP_NAME} — Access error", _COLOR_ERROR)
+        logger.error("Could not connect to StudioVision via COM: %s", e)
+        _set_status("{} — Access error".format(APP_NAME), _COLOR_ERROR)
         return
 
     try:
         form = access.Forms("REFRACTION")
     except Exception as e:
-        logger.error(f"Le formulaire 'REFRACTION' n'est pas ouvert dans Access: {e}")
-        _set_status(f"{APP_NAME} — Form not found", _COLOR_ERROR)
+        logger.error("Form 'REFRACTION' not open in Access: %s", e)
+        _set_status("{} — Form not found".format(APP_NAME), _COLOR_ERROR)
         return
 
     eye = data["eye"]
     mapping = {
-        "SPH": f"SPHERE {eye}",
-        "CYL": f"CYLINDRE {eye}",
-        "AXS": f"AXE {eye}",
-        "ADD": f"ADD {eye}",
+        "SPH": "SPHERE {}".format(eye),
+        "CYL": "CYLINDRE {}".format(eye),
+        "AXS": "AXE {}".format(eye),
+        "ADD": "ADD {}".format(eye),
     }
 
-    succes_count = 0
+    success_count = 0
     for key, field_name in mapping.items():
         if key in data:
             try:
                 form.Controls(field_name).Value = data[key]
-                logger.info(f"  ✅ Injection OK: {field_name:<15} = {data[key]}")
-                succes_count += 1
+                logger.info("  %s = %s", field_name, data[key])
+                success_count += 1
             except Exception as e:
-                logger.error(f"  ❌ Échec injection sur {field_name}: {e}")
+                logger.error("  Field '%s' write failed: %s", field_name, e)
 
-    logger.info(f"Injection terminée ({succes_count} champs modifiés pour {eye}).")
-    _set_status(f"{APP_NAME} — Data sent ({eye})", _COLOR_ACTIVE)
-    _notify("Refractomètre", f"{succes_count} valeurs {eye} injectées")
+    logger.info("Injection complete (%d field(s) written for %s).", success_count, eye)
+    _set_status("{} — Data sent ({})".format(APP_NAME, eye), _COLOR_ACTIVE)
+    _notify("Refractometer", "{} value(s) injected for {}".format(success_count, eye))
     time.sleep(2)
-    _set_status(f"{APP_NAME} — Waiting", _COLOR_READY)
+    _set_status("{} — Waiting".format(APP_NAME), _COLOR_READY)
+
 
 def monitor_serial():
-    logger.info(f"Tentative d'ouverture de {SERIAL_PORT} à {BAUD_RATE} bps...")
+    """Continuously reads the serial port and dispatches parsed frames to Access."""
+    logger.info("Opening %s at %d bps...", SERIAL_PORT, BAUD_RATE)
     while not _stop_event.is_set():
         try:
             with serial.Serial(
@@ -195,8 +207,8 @@ def monitor_serial():
                 stopbits=STOPBITS,
                 timeout=1,
             ) as ser:
-                logger.info(f"Port série {SERIAL_PORT} ouvert. En attente de données...")
-                _set_status(f"{APP_NAME} — Waiting", _COLOR_READY)
+                logger.info("%s open — waiting for frames...", SERIAL_PORT)
+                _set_status("{} — Waiting".format(APP_NAME), _COLOR_READY)
                 buffer = ""
                 while not _stop_event.is_set():
                     raw = ser.read(256)
@@ -207,25 +219,32 @@ def monitor_serial():
                             line = line.strip()
                             if not line:
                                 continue
-                            logger.info(f"==> Trame reçue du port série : {line}")
+                            logger.info("Frame received: %s", line)
                             data = parse_trame(line)
                             if data:
-                                t = threading.Thread(target=inject_into_access, args=(data,), name=f"Inject_{data['eye']}")
+                                # Inject in a separate thread to avoid blocking serial reads
+                                t = threading.Thread(
+                                    target=inject_into_access,
+                                    args=(data,),
+                                    name="Inject_{}".format(data["eye"]),
+                                )
                                 t.daemon = True
                                 t.start()
 
         except serial.SerialException as e:
-            logger.error(f"Erreur Port Série {SERIAL_PORT}: {e}. Nouvelle tentative dans 5s...")
-            _set_status(f"{APP_NAME} — Serial port error", _COLOR_ERROR)
+            logger.error("Serial port error on %s: %s — retrying in 5s...", SERIAL_PORT, e)
+            _set_status("{} — Serial port error".format(APP_NAME), _COLOR_ERROR)
             time.sleep(5)
         except Exception as e:
-            logger.critical(f"Erreur inattendue dans monitor_serial: {e}")
-            _set_status(f"{APP_NAME} — Unexpected error", _COLOR_ERROR)
+            logger.critical("Unexpected error in monitor_serial: %s", e)
+            _set_status("{} — Unexpected error".format(APP_NAME), _COLOR_ERROR)
             time.sleep(5)
 
-    logger.info("Thread série arrêté.")
+    logger.info("Serial thread stopped.")
+
 
 def _get_msaccess_pids():
+    """Returns the set of all running msaccess.exe PIDs."""
     pids = set()
     for proc in psutil.process_iter(["pid", "name"]):
         try:
@@ -235,38 +254,44 @@ def _get_msaccess_pids():
             pass
     return pids
 
+
 def _launch_studio_vision():
-    logger.info("Démarrage de StudioVision...")
-    _set_status(f"{APP_NAME} — Launching StudioVision...", _COLOR_READY)
+    """
+    Launches StudioVision and monitors msaccess.exe.
+    Triggers shutdown when StudioVision is closed.
+    Force-kills zombie msaccess.exe processes on exit to release COM locks.
+    """
+    logger.info("Launching StudioVision...")
+    _set_status("{} — Launching StudioVision...".format(APP_NAME), _COLOR_READY)
 
     pids_before = _get_msaccess_pids()
 
     try:
         subprocess.Popen(STUDIO_VISION_CMD)
     except FileNotFoundError:
-        logger.error(f"Exécutable introuvable: {STUDIO_VISION_CMD[0]}. Arrêt.")
-        _set_status(f"{APP_NAME} — Executable not found", _COLOR_ERROR)
+        logger.error("Executable not found: %s. Shutting down.", STUDIO_VISION_CMD[0])
+        _set_status("{} — Executable not found".format(APP_NAME), _COLOR_ERROR)
         _stop_event.set()
         return
     except Exception as e:
-        logger.error(f"Impossible de lancer StudioVision: {e}")
-        _set_status(f"{APP_NAME} — Launch error", _COLOR_ERROR)
+        logger.error("Could not launch StudioVision: %s", e)
+        _set_status("{} — Launch error".format(APP_NAME), _COLOR_ERROR)
         _stop_event.set()
         return
 
-    logger.info(f"En attente du processus msaccess.exe (max {_SV_STARTUP_TIMEOUT}s)...")
+    logger.info("Waiting for msaccess.exe (max %ds)...", _SV_STARTUP_TIMEOUT)
     deadline = time.monotonic() + _SV_STARTUP_TIMEOUT
 
     while time.monotonic() < deadline and not _stop_event.is_set():
         if _get_msaccess_pids() - pids_before:
-            logger.info("StudioVision est démarré.")
-            _set_status(f"{APP_NAME} — StudioVision running", _COLOR_READY)
+            logger.info("StudioVision is running.")
+            _set_status("{} — StudioVision running".format(APP_NAME), _COLOR_READY)
             break
         time.sleep(1)
     else:
         if not _stop_event.is_set():
-            logger.error("msaccess.exe n'est pas apparu dans les temps. Arrêt.")
-            _set_status(f"{APP_NAME} — SV did not start", _COLOR_ERROR)
+            logger.error("msaccess.exe did not appear. Shutting down.")
+            _set_status("{} — SV did not start".format(APP_NAME), _COLOR_ERROR)
             _stop_event.set()
         return
 
@@ -282,21 +307,21 @@ def _launch_studio_vision():
 
             if not current_pids:
                 consecutive_empty += 1
-                logger.debug(f"StudioVision absent ({consecutive_empty}/{_EMPTY_THRESHOLD}).")
+                logger.debug("StudioVision missing (%d/%d).", consecutive_empty, _EMPTY_THRESHOLD)
                 if consecutive_empty >= _EMPTY_THRESHOLD:
-                    logger.info("Fermeture de StudioVision détectée. Arrêt du pont.")
+                    logger.info("StudioVision closed by user. Initiating shutdown.")
                     break
             else:
                 consecutive_empty = 0
     except Exception as e:
-        logger.error(f"Erreur lors de la surveillance de msaccess.exe: {e}")
+        logger.error("Error monitoring msaccess.exe: %s", e)
     finally:
         for pid in tracked_pids:
             try:
                 p = psutil.Process(pid)
                 if p.is_running():
                     p.kill()
-                    logger.warning(f"Processus msaccess.exe (PID {pid}) tué de force pour libérer le COM.")
+                    logger.warning("Force-killed zombie msaccess.exe (PID %d).", pid)
             except Exception:
                 pass
 
@@ -306,13 +331,14 @@ def _launch_studio_vision():
                 _icon.stop()
             except Exception:
                 pass
-        logger.info("Cycle de vie SV arrêté.")
+        logger.info("Lifecycle thread stopped.")
+
 
 def main():
     global _icon
 
-    logger.info("=== Démarrage de Fronto ===")
-    
+    logger.info("Fronto starting.")
+
     sv_thread = threading.Thread(target=_launch_studio_vision, name="SV_Launcher")
     sv_thread.daemon = True
     sv_thread.start()
@@ -322,21 +348,21 @@ def main():
     serial_thread.start()
 
     if not TRAY_AVAILABLE:
-        logger.warning("Librairies systray (pystray/Pillow) non disponibles — exécution en mode console.")
+        logger.warning("pystray/Pillow not available — running headless.")
         try:
             while not _stop_event.is_set():
                 time.sleep(1)
         except KeyboardInterrupt:
-            logger.info("Interruption clavier détectée.")
+            logger.info("Keyboard interrupt.")
         finally:
             _stop_event.set()
-        logger.info("Application arrêtée.")
+        logger.info("Application stopped.")
         return
 
     menu = pystray.Menu(
         pystray.MenuItem(text=lambda item: _status_text, action=None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quitter", _quit),
+        pystray.MenuItem("Quit", _quit),
     )
 
     _icon = pystray.Icon(
@@ -346,13 +372,14 @@ def main():
         menu=menu,
     )
 
-    logger.info("Icône système démarrée.")
+    logger.info("System tray icon started.")
     _icon.run()
 
     _stop_event.set()
     sv_thread.join(timeout=15)
     serial_thread.join(timeout=5)
-    logger.info("=== Arrêt complet de Fronto ===")
+    logger.info("Application stopped.")
+
 
 if __name__ == "__main__":
     main()

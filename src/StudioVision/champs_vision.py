@@ -1,5 +1,6 @@
 """
 diagnostic_access.py
+====================
 Run this script WHILE Studio Vision is open and a patient is displayed.
 It dumps every control name/value visible in the active form and all
 subforms, so we can find exactly where Code patient / NOM / Prénom live.

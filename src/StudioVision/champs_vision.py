@@ -32,6 +32,7 @@ def p(text=""):
 def dump_controls(form, depth=0):
     """Recursively dumps all controls of a form, including subforms."""
     indent = "  " * depth
+
     try:
         count = form.Controls.Count
     except Exception as e:
@@ -60,24 +61,46 @@ def dump_controls(form, depth=0):
             value = "<no value>"
 
         type_name = {
-            100: "Label", 101: "Rectangle", 102: "Line", 103: "Image",
-            104: "CommandButton", 105: "ToggleButton", 106: "OptionButton",
-            107: "CheckBox", 108: "OptionGroup", 109: "BoundObjectFrame",
-            110: "TextBox", 111: "ListBox", 112: "SubForm", 113: "ComboBox",
-            114: "ObjectFrame", 118: "PageBreak", 119: "CustomControl",
-            122: "Attachment", 123: "TabControl", 124: "Page",
+            100: "Label",
+            101: "Rectangle",
+            102: "Line",
+            103: "Image",
+            104: "CommandButton",
+            105: "ToggleButton",
+            106: "OptionButton",
+            107: "CheckBox",
+            108: "OptionGroup",
+            109: "BoundObjectFrame",
+            110: "TextBox",
+            111: "ListBox",
+            112: "SubForm",
+            113: "ComboBox",
+            114: "ObjectFrame",
+            118: "PageBreak",
+            119: "CustomControl",
+            122: "Attachment",
+            123: "TabControl",
+            124: "Page",
         }.get(ctrl_type, f"Type{ctrl_type}")
 
         marker = " <-- LENTILLE" if "lentil" in name.lower() else ""
-        p(f"{indent}[{i}] {type_name:<15} Name={name!r:<40} Value={value}{marker}")
 
-        if ctrl_type == 112:  # Subform — recurse
+        p(
+            f"{indent}[{i}] "
+            f"{type_name:<15} "
+            f"Name={name!r:<40} "
+            f"Value={value}{marker}"
+        )
+
+        # Sous-formulaire
+        if ctrl_type == 112:
             try:
                 dump_controls(ctrl.Form, depth + 2)
             except Exception as e:
                 p(f"{indent}  [Subform error: {e}]")
 
-        if ctrl_type == 123:  # TabControl — controls are in child Pages
+        # Onglets
+        if ctrl_type == 123:
             p(f"{indent}  [TabControl: controls are distributed across its Pages]")
 
 
@@ -87,8 +110,13 @@ def main():
     p("Studio Vision — Deep Access scanner (via ROT)")
     p()
 
-    rot  = pythoncom.GetRunningObjectTable()
-    enum = rot.EnumRunning()
+    try:
+        rot = pythoncom.GetRunningObjectTable()
+        enum = rot.EnumRunning()
+    except Exception as e:
+        p(f"ERROR: Unable to access ROT: {e}")
+        _save_and_exit()
+        return
 
     instances_found = 0
 
@@ -97,46 +125,67 @@ def main():
             result = enum.Next()
         except Exception:
             break
-        if result is None:
+
+        # Correction du bug IndexError
+        if not result:
             break
 
-        moniker = result[0] if isinstance(result, tuple) else result
+        if isinstance(result, tuple):
+            if len(result) == 0:
+                break
+            moniker = result[0]
+        else:
+            moniker = result
 
         try:
-            ctx  = pythoncom.CreateBindCtx(0)
+            ctx = pythoncom.CreateBindCtx(0)
             name = moniker.GetDisplayName(ctx, None)
         except Exception:
             continue
 
-        if not any(name.lower().endswith(ext) for ext in (".mde", ".mdb", ".accdb")):
+        if not any(
+            name.lower().endswith(ext)
+            for ext in (".mde", ".mdb", ".accdb")
+        ):
             continue
 
         instances_found += 1
         p(f"Access instance found: {name}")
 
         try:
-            obj      = rot.GetObject(moniker)
+            obj = rot.GetObject(moniker)
             dispatch = obj.QueryInterface(pythoncom.IID_IDispatch)
-            db_obj   = win32com.client.Dispatch(dispatch)
+            db_obj = win32com.client.Dispatch(dispatch)
 
             try:
                 app = db_obj.Application
             except Exception:
                 app = db_obj
 
-            fc = app.Forms.Count
+            try:
+                fc = app.Forms.Count
+            except Exception as e:
+                p(f"  [Cannot enumerate forms: {e}]")
+                continue
+
             p(f"  Open forms: {fc}")
 
             for j in range(fc):
-                form_name = app.Forms(j).Name
-                p(f"  Form: {form_name!r}")
-                dump_controls(app.Forms(j), depth=2)
+                try:
+                    form = app.Forms(j)
+                    form_name = form.Name
+
+                    p(f"  Form: {form_name!r}")
+                    dump_controls(form, depth=2)
+
+                except Exception as e:
+                    p(f"  [Form access error: {e}]")
 
         except Exception as e:
             p(f"  [Connection error: {e}]")
 
     if instances_found == 0:
-        p("ERROR: No Access database (.mde, .mdb) found in memory.")
+        p("ERROR: No Access database (.mde, .mdb, .accdb) found in memory.")
         p("Make sure Studio Vision is open.")
 
     p()
@@ -147,6 +196,7 @@ def main():
 
 def _save_and_exit():
     text = "\n".join(lines)
+
     try:
         OUTPUT_FILE.write_text(text, encoding="utf-8")
     except Exception as e:

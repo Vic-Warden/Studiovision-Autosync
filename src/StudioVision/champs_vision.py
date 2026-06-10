@@ -1,13 +1,12 @@
 """
-diagnostic_access.py
-====================
-Run this script WHILE Studio Vision is open and a patient is displayed.
-It dumps every control name/value visible in the active form and all
-subforms, so we can find exactly where Code patient / NOM / Prénom live.
+champs_vision.py
+
+Scans all open Access forms via the Running Object Table (ROT) and dumps
+every control (name, type, value), recursing into subforms and tab pages.
+Useful for discovering hidden or nested fields in StudioVision.
 
 Usage:
-    python diagnostic_access.py
-    (or double-click it — output goes to diagnostic_output.txt on the Desktop)
+    python champs_vision.py
 """
 
 import os
@@ -21,8 +20,9 @@ except ImportError:
     input("ERROR: pywin32 not installed. Press Enter to exit.")
     sys.exit(1)
 
-OUTPUT_FILE = Path(os.path.expanduser("~")) / "Desktop" / "diagnostic_output.txt"
+OUTPUT_FILE = Path(os.path.expanduser("~")) / "Desktop" / "diagnostic_lentilles.txt"
 lines = []
+
 
 def p(text=""):
     print(text)
@@ -30,18 +30,18 @@ def p(text=""):
 
 
 def dump_controls(form, depth=0):
+    """Recursively dumps all controls of a form, including subforms."""
     indent = "  " * depth
     try:
         count = form.Controls.Count
     except Exception as e:
-        p(f"{indent}[Cannot read controls: {e}]")
+        p(f"{indent}[Could not read controls: {e}]")
         return
 
     for i in range(count):
         try:
             ctrl = form.Controls(i)
-        except Exception as e:
-            p(f"{indent}[Control {i} error: {e}]")
+        except Exception:
             continue
 
         try:
@@ -59,71 +59,88 @@ def dump_controls(form, depth=0):
         except Exception:
             value = "<no value>"
 
-        # ControlType 112 = subform, 109 = text box, 110 = label, etc.
         type_name = {
             100: "Label", 101: "Rectangle", 102: "Line", 103: "Image",
             104: "CommandButton", 105: "ToggleButton", 106: "OptionButton",
             107: "CheckBox", 108: "OptionGroup", 109: "BoundObjectFrame",
             110: "TextBox", 111: "ListBox", 112: "SubForm", 113: "ComboBox",
             114: "ObjectFrame", 118: "PageBreak", 119: "CustomControl",
-            122: "Attachment", 123: "NavigationControl",
+            122: "Attachment", 123: "TabControl", 124: "Page",
         }.get(ctrl_type, f"Type{ctrl_type}")
 
-        p(f"{indent}[{i}] {type_name:<15} Name={name!r:<40} Value={value}")
+        marker = " <-- LENTILLE" if "lentil" in name.lower() else ""
+        p(f"{indent}[{i}] {type_name:<15} Name={name!r:<40} Value={value}{marker}")
 
-        # Recurse into subforms
-        if ctrl_type == 112:
-            p(f"{indent}  >>> Entering subform: {name!r}")
+        if ctrl_type == 112:  # Subform — recurse
             try:
                 dump_controls(ctrl.Form, depth + 2)
             except Exception as e:
                 p(f"{indent}  [Subform error: {e}]")
-            p(f"{indent}  <<< End subform: {name!r}")
+
+        if ctrl_type == 123:  # TabControl — controls are in child Pages
+            p(f"{indent}  [TabControl: controls are distributed across its Pages]")
 
 
 def main():
     pythoncom.CoInitialize()
 
-    p("=" * 70)
-    p("Studio Vision — Access COM Diagnostic")
-    p("=" * 70)
+    p("Studio Vision — Deep Access scanner (via ROT)")
     p()
 
-    try:
-        access = win32com.client.GetActiveObject("Access.Application")
-        p(f"Access version : {access.Version}")
-        p(f"Access visible : {access.Visible}")
-        p()
-    except Exception as e:
-        p(f"ERROR: Cannot connect to Access.Application: {e}")
-        p()
-        p("Make sure Studio Vision is open and a patient record is displayed.")
-        _save_and_exit()
-        return
+    rot  = pythoncom.GetRunningObjectTable()
+    enum = rot.EnumRunning()
 
-    try:
-        form = access.Screen.ActiveForm
-        if form is None:
-            p("ERROR: access.Screen.ActiveForm is None — no form is active.")
-            p("Click on the patient form in Studio Vision and run again.")
-            _save_and_exit()
-            return
-        p(f"Active form name : {form.Name!r}")
-        p(f"Active form caption : {getattr(form, 'Caption', '?')!r}")
-        p()
-    except Exception as e:
-        p(f"ERROR reading ActiveForm: {e}")
-        _save_and_exit()
-        return
+    instances_found = 0
 
-    p("--- All controls (recursing into subforms) ---")
+    while True:
+        try:
+            result = enum.Next()
+        except Exception:
+            break
+        if result is None:
+            break
+
+        moniker = result[0] if isinstance(result, tuple) else result
+
+        try:
+            ctx  = pythoncom.CreateBindCtx(0)
+            name = moniker.GetDisplayName(ctx, None)
+        except Exception:
+            continue
+
+        if not any(name.lower().endswith(ext) for ext in (".mde", ".mdb", ".accdb")):
+            continue
+
+        instances_found += 1
+        p(f"Access instance found: {name}")
+
+        try:
+            obj      = rot.GetObject(moniker)
+            dispatch = obj.QueryInterface(pythoncom.IID_IDispatch)
+            db_obj   = win32com.client.Dispatch(dispatch)
+
+            try:
+                app = db_obj.Application
+            except Exception:
+                app = db_obj
+
+            fc = app.Forms.Count
+            p(f"  Open forms: {fc}")
+
+            for j in range(fc):
+                form_name = app.Forms(j).Name
+                p(f"  Form: {form_name!r}")
+                dump_controls(app.Forms(j), depth=2)
+
+        except Exception as e:
+            p(f"  [Connection error: {e}]")
+
+    if instances_found == 0:
+        p("ERROR: No Access database (.mde, .mdb) found in memory.")
+        p("Make sure Studio Vision is open.")
+
     p()
-    dump_controls(form)
-
-    p()
-    p("=" * 70)
-    p("Diagnostic complete.")
-    p(f"Output saved to: {OUTPUT_FILE}")
+    p(f"Scan complete. Output saved to: {OUTPUT_FILE}")
 
     _save_and_exit()
 
@@ -132,9 +149,8 @@ def _save_and_exit():
     text = "\n".join(lines)
     try:
         OUTPUT_FILE.write_text(text, encoding="utf-8")
-        print(f"\nSaved to {OUTPUT_FILE}")
     except Exception as e:
-        print(f"Could not save file: {e}")
+        print(f"Save error: {e}")
 
     try:
         os.startfile(str(OUTPUT_FILE))

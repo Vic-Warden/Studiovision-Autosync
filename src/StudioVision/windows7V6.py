@@ -239,13 +239,13 @@ def wait_for_network_share() -> None:
 def build_patient_relative_path(patient_code: str, last_name: str, first_name: str) -> str:
     """
     Returns the relative folder path using the Studio Vision naming convention.
-    Format: <first2digits>.000\\<code><last3>.<first3>
-    Example: code=1758511228, ABCDEF, DEFGH → "17.000\\1758511228abc.def"
+    Format: <first2digits>.000\\<code><last4>.<first3>
+    Example: code=1758511228, DE GAULLE, JEAN → "17.000\\1758511228dega.jea"
     """
     prefix  = patient_code[:2]
-    last_3  = last_name[:3].lower()
-    first_3 = first_name[:3].lower()
-    return "{0}.000\\{1}{2}.{3}".format(prefix, patient_code, last_3, first_3)
+    last_4  = last_name.replace(" ", "").replace("'", "").replace("-", "")[:4].lower()
+    first_3 = first_name.replace(" ", "").replace("'", "").replace("-", "")[:3].lower()
+    return "{0}.000\\{1}{2}.{3}".format(prefix, patient_code, last_4, first_3)
 
 
 def resolve_patient_folder(patient: dict) -> Optional[Path]:

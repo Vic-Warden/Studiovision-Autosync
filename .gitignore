@@ -12,4 +12,6 @@ tests/*
 
 src/Logs/Vic Logs/*
 
+src/donnés_pdf/*
+
 .DS_Store

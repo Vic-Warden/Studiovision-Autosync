@@ -10,10 +10,6 @@ tests/.DS_Store
 # Ignore all files in tests/
 tests/*
 
-# Ignore all files in src/Logs/Vic Logs/
-src/Logs/Vic Logs/*
-
-# Ignore all files in src/Logs/Logs/
 donnés_pdf/*
 
 # Ignore all .DS_Store files

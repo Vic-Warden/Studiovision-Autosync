@@ -58,7 +58,7 @@ BOX_NAME    = "Box 2"
 
 STUDIO_VISION_EXE = "studiovision.exe"
 
-SOURCE_DIR  = Path(r"\\nidek-box\master")
+SOURCE_DIR  = Path(r"\\RETINO-PC\master")
 ORPHAN_DIR  = Path(r"C:\Users\Admin\Desktop\Images_Oubliées")
 DEST_PHOTOS = Path(r"\\studiovision\Studiov2000-OM\PHOTOS")
 PUBLIC_MDB  = Path(r"\\studiovision\Studiov2000-OM\fichier\PUBLIC.MDB")
@@ -624,7 +624,7 @@ def worker(file_queue: queue.Queue) -> None:
 
             log.info(f"Patient: {patient['nom']} {patient['prenom']} (code {patient['code']})")
 
-            patient_folder = find_patient_folder(patient["code"])
+            patient_folder = find_patient_folder(patient)
             if not patient_folder:
                 log.error(f"Could not resolve folder for patient {patient['code']}. Orphaning.")
                 orphan_file(file)

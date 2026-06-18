@@ -10,6 +10,7 @@ tests/.DS_Store
 # Ignore all files in tests/
 tests/*
 
+# Ignore all files in donnés_pdf/
 donnés_pdf/*
 
 # Ignore all .DS_Store files

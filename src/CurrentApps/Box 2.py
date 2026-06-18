@@ -16,6 +16,7 @@ Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
 
 import os
 import pythoncom
+import subprocess
 import queue
 import shutil
 import sys
@@ -56,13 +57,28 @@ import psutil
 
 BOX_NAME    = "Box 2"
 
-STUDIO_VISION_EXE = "studiovision.exe"
+STUDIO_VISION_EXE = "msaccess.exe"
 
 SOURCE_DIR  = Path(r"\\RETINO-PC\master")
 ORPHAN_DIR  = Path(r"C:\Users\Admin\Desktop\Images_Oubliées")
 DEST_PHOTOS = Path(r"\\studiovision\Studiov2000-OM\PHOTOS")
 PUBLIC_MDB  = Path(r"\\studiovision\Studiov2000-OM\fichier\PUBLIC.MDB")
 DOCUM_MDB   = Path(r"\\studiovision\Studiov2000-OM\fichier\DOCUM.MDB")
+
+STUDIO_VISION_CMD = [
+    r"C:\Studiov2000-OM\svprog\msaccess.exe",
+    "/runtime",
+    r"C:\Studiov2000-OM\svprog\Ophprog.mde",
+    "/wrkgrp",
+    r"C:\Studiov2000-OM\config\system.mdw",
+    "/User",
+    "/Pwd",
+    "/X",
+    "demarrage",
+]
+
+_SV_POLL_INTERVAL   = 3
+_SV_STARTUP_TIMEOUT = 30
 
 WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt"}
 FILE_LOCK_RETRY_DELAY  = 3
@@ -142,6 +158,87 @@ def _set_status(text: str, processing: bool = False) -> None:
             _icon.update_menu()
         except Exception as e:
             log.debug(f"Tray update failed: {e}")
+            
+def _get_msaccess_pids() -> set[int]:
+    """Returns the set of all running msaccess.exe PIDs."""
+    pids: set[int] = set()
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if (proc.info["name"] or "").lower() == "msaccess.exe":
+                pids.add(proc.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return pids
+
+
+def _launch_studio_vision() -> None:
+    """Launches Studio Vision and tracks any new msaccess.exe instances."""
+    log.info(f"Launching Studio Vision: {' '.join(STUDIO_VISION_CMD)}")
+
+    pids_before: set[int] = _get_msaccess_pids()
+
+    try:
+        subprocess.Popen(STUDIO_VISION_CMD)
+    except FileNotFoundError:
+        log.critical(f"Studio Vision executable not found. Shutting down.")
+        _stop_event.set()
+        return
+    except Exception as exc:
+        log.error(f"Could not launch Studio Vision: {exc}. Shutting down.")
+        _stop_event.set()
+        return
+
+    log.info(f"Waiting up to {_SV_STARTUP_TIMEOUT}s for msaccess.exe to start...")
+    deadline = time.monotonic() + _SV_STARTUP_TIMEOUT
+
+    while time.monotonic() < deadline and not _stop_event.is_set():
+        if _get_msaccess_pids() - pids_before:
+            log.info("Studio Vision is starting...")
+            break
+        time.sleep(1)
+    else:
+        if not _stop_event.is_set():
+            log.error("msaccess.exe did not appear. Shutting down.")
+            _stop_event.set()
+        return
+
+    consecutive_empty = 0
+    _EMPTY_THRESHOLD  = 2
+    tracked_pids: set[int] = set()
+
+    try:
+        while not _stop_event.is_set():
+            time.sleep(_SV_POLL_INTERVAL)
+            
+            current_pids = _get_msaccess_pids() - pids_before
+            tracked_pids.update(current_pids)
+
+            if not current_pids:
+                consecutive_empty += 1
+                if consecutive_empty >= _EMPTY_THRESHOLD:
+                    log.info("Studio Vision closed by user. Initiating shutdown.")
+                    break
+            else:
+                consecutive_empty = 0
+                
+    except Exception as exc:
+        log.error(f"Error while monitoring msaccess.exe: {exc}")
+    finally:
+        for pid in tracked_pids:
+            try:
+                p = psutil.Process(pid)
+                if p.is_running():
+                    p.kill()
+                    log.info(f"Force-killed zombie msaccess.exe (PID {pid}) to release COM locks.")
+            except Exception:
+                pass
+
+        _stop_event.set()
+        if _icon is not None:
+            try:
+                _icon.stop()
+            except Exception:
+                pass
 
 
 def _notify(title: str, message: str = "") -> None:
@@ -795,6 +892,8 @@ def main() -> None:
     threading.Thread(
         target=_run_background, args=(file_queue,), name="Background", daemon=True
     ).start()
+    
+    threading.Thread(target=_launch_studio_vision, name="StudioVisionLauncher", daemon=True).start()
 
     if not TRAY_AVAILABLE:
         log.warning("pystray/Pillow not available — running without system tray.")

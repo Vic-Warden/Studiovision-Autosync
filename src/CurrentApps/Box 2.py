@@ -118,7 +118,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.FileHandler(_LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger("image_router")
@@ -563,7 +562,16 @@ def prevent_sleep() -> None:
 
 
 def clear_source_dir() -> None:
-    items = list(SOURCE_DIR.iterdir())
+    """Removes leftover files from SOURCE_DIR at startup. Never raises —
+    a missing/unmounted share must not kill the Background thread."""
+    if not SOURCE_DIR.is_dir():
+        log.warning(f"clear_source_dir skipped: {SOURCE_DIR} not accessible.")
+        return
+    try:
+        items = list(SOURCE_DIR.iterdir())
+    except Exception as exc:
+        log.warning(f"clear_source_dir: could not list {SOURCE_DIR}: {exc}")
+        return
     if not items:
         log.info(f"Source directory already empty: {SOURCE_DIR}")
         return
@@ -788,12 +796,10 @@ def _run_background(file_queue: queue.Queue) -> None:
     """
     Wraps the PollingObserver lifecycle and auto-reconnect loop.
     Runs in a daemon thread so pystray can own the main thread.
-    Includes the Box 2 startup clear_source_dir() call.
+    clear_source_dir() now runs synchronously in main() before this thread
+    starts, mirroring Box 1's startup-scan-before-launch ordering.
     """
     _RECONNECT_WAIT = 15
-
-    # Box 2: clear leftover files before the observer starts watching.
-    clear_source_dir()
 
     def _start_observer() -> Observer:
         obs = Observer()
@@ -838,10 +844,21 @@ def main() -> None:
     global _icon, _mutex_handle
 
     # Single-instance guard: only one instance may run at a time.
-    # If a previous instance is already active, exit silently.
+    # If the mutex already exists, verify that another router process is
+    # genuinely alive before exiting — a crashed previous instance can leave
+    # a stale mutex handle that would otherwise block every future launch.
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_Box2_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-        sys.exit(0)
+        router_alive = any(
+            (p.info["name"] or "").lower() in ("python.exe", "pythonw.exe")
+            and p.info["pid"] != os.getpid()
+            for p in psutil.process_iter(["pid", "name"])
+        )
+        if router_alive:
+            log.warning("Another instance is already running. Exiting.")
+            sys.exit(0)
+        else:
+            log.warning("Stale mutex detected (previous crash). Continuing.")
 
     # Manual-relaunch guard: if the parent is explorer.exe (double-click)
     # and Studio Vision is already running, block the launch and notify.
@@ -892,8 +909,14 @@ def main() -> None:
     threading.Thread(
         target=_run_background, args=(file_queue,), name="Background", daemon=True
     ).start()
-    
-    threading.Thread(target=_launch_studio_vision, name="StudioVisionLauncher", daemon=True).start()
+
+    log.info("Startup cleanup — clearing source directory...")
+    clear_source_dir()
+
+    sv_thread = threading.Thread(
+        target=_launch_studio_vision, name="StudioVisionLauncher", daemon=True
+    )
+    sv_thread.start()
 
     if not TRAY_AVAILABLE:
         log.warning("pystray/Pillow not available — running without system tray.")

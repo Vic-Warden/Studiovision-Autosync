@@ -236,30 +236,43 @@ def wait_for_network_share() -> None:
 
 
 # Patient folder resolution
-def build_patient_relative_path(patient_code: str, last_name: str, first_name: str) -> str:
-    """
-    Returns the relative folder path using the Studio Vision naming convention.
-    Format: <first2digits>.000\\<code><last4>.<first3>
-    Example: code=1758511228, DE GAULLE, CHARLES → "17.000\\1758511228dega.cha"
-    """
-    prefix   = patient_code[:2]
-    clean    = str.maketrans("", "", " '-")
-    last_4   = last_name.translate(clean).lower()[:4]
-    first_3  = first_name.translate(clean).lower()[:3]
-    return "{0}.000\\{1}{2}.{3}".format(prefix, patient_code, last_4, first_3)
-
-
 def resolve_patient_folder(patient: dict) -> Optional[Path]:
-    """Resolves and creates the absolute patient folder on disk. Returns None on failure."""
-    try:
-        rel    = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
-        folder = DEST_PHOTOS / rel
-        folder.mkdir(parents=True, exist_ok=True)
-        log.info("Patient folder resolved: %s", folder)
-        return folder
-    except Exception as exc:
-        log.error("Could not resolve/create patient folder: %s", exc)
+    """
+    Cherche le dossier patient existant via son code. Ne crée jamais de dossier.
+    Retourne None si le dossier parent ou le dossier patient n'existe pas.
+    """
+    code = patient["code"]
+    is_negative = code.startswith("-")
+    digits = code[1:] if is_negative else code
+
+    if is_negative:
+        parent_dir = DEST_PHOTOS / "-{0}.000".format(digits[:1])
+    else:
+        parent_dir = DEST_PHOTOS / "{0}.000".format(digits[:2])
+
+    if not parent_dir.is_dir():
+        log.warning("Dossier parent introuvable pour le code %s: %s", code, parent_dir)
         return None
+
+    for entry in parent_dir.iterdir():
+        if not entry.is_dir():
+            continue
+
+        # On ignore un éventuel "-" parasite en tête du nom de dossier
+        name_digits = entry.name.lstrip("-")
+        if not name_digits.startswith(digits):
+            continue
+
+        # Le caractère qui suit le code ne doit pas être un chiffre
+        suffix = name_digits[len(digits):]
+        if suffix and suffix[0].isdigit():
+            continue
+
+        log.info("Dossier patient trouvé: %s", entry)
+        return entry
+
+    log.warning("Aucun dossier patient trouvé pour le code %s dans %s", code, parent_dir)
+    return None
 
 
 # Access COM — read active patient
@@ -555,8 +568,7 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            rel_path      = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
-            relative_path = "\\{0}\\{1}".format(rel_path, dest.name)
+            relative_path = "\\{0}".format(dest.relative_to(DEST_PHOTOS))
             description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             time.sleep(_GUI_PRE_INSERT_DELAY)

@@ -117,14 +117,14 @@ WATCHED_EXTENSIONS: set[str] = {
 }
 
 EXAM_DESCRIPTION: dict[str, str] = {
-    ".jpg":  "Image",
-    ".jpeg": "Image",
-    ".jfif": "Image",
-    ".png":  "Image",
-    ".bmp":  "Image",
-    ".tif":  "OCT",
-    ".tiff": "OCT",
-    ".dcm":  "DICOM",
+    ".jpg":  "Champ Visuel",
+    ".jpeg": "Champ Visuel",
+    ".jfif": "Champ Visuel",
+    ".png":  "Champ Visuel",
+    ".bmp":  "Champ Visuel",
+    ".tif":  "Champ Visuel",
+    ".tiff": "Champ Visuel",
+    ".dcm":  "Champ Visuel",
     ".pdf":  "Champ Visuel",
     ".rtf":  "Champ Visuel",
     ".doc":  "Champ Visuel",
@@ -264,29 +264,48 @@ def wait_for_network_share() -> None:
 
 
 # Patient folder resolution
-def build_patient_relative_path(patient_code: str, last_name: str, first_name: str) -> str:
-    prefix   = patient_code[:2]
-    clean    = str.maketrans("", "", " '-")
-    last_4   = last_name.translate(clean).lower()[:4]
-    first_3  = first_name.translate(clean).lower()[:3]
-    return f"{prefix}.000\\{patient_code}{last_4}.{first_3}"
-
-
 def resolve_patient_folder(patient: dict) -> Path | None:
-    """Resolves the patient folder in the instance's dest_photos. Returns None on failure."""
+    """
+    Cherche le dossier patient existant via son code dans le répertoire de l'instance.
+    Ne crée jamais de dossier. Retourne None en cas d'échec.
+    """
     inst = patient.get("instance")
     if inst is None:
         log.error("resolve_patient_folder: no instance in patient dict.")
         return None
-    try:
-        rel    = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
-        folder = inst.dest_photos / rel
-        folder.mkdir(parents=True, exist_ok=True)
-        log.info(f"[{inst.name}] Patient folder resolved: {folder}")
-        return folder
-    except Exception as exc:
-        log.error(f"[{inst.name}] Could not resolve/create patient folder: {exc}")
+
+    code = patient["code"]
+    is_negative = code.startswith("-")
+    digits = code[1:] if is_negative else code
+
+    if is_negative:
+        parent_dir = inst.dest_photos / f"-{digits[:1]}.000"
+    else:
+        parent_dir = inst.dest_photos / f"{digits[:2]}.000"
+
+    if not parent_dir.is_dir():
+        log.warning(f"[{inst.name}] Dossier parent introuvable pour le code {code}: {parent_dir}")
         return None
+
+    for entry in parent_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        
+        # On ignore un éventuel "-" parasite en tête du nom de dossier
+        name_digits = entry.name.lstrip("-")
+        if not name_digits.startswith(digits):
+            continue
+            
+        # Le caractère qui suit le code ne doit pas être un chiffre
+        suffix = name_digits[len(digits):]
+        if suffix and suffix[0].isdigit():
+            continue
+            
+        log.info(f"[{inst.name}] Dossier patient trouvé: {entry}")
+        return entry
+
+    log.warning(f"[{inst.name}] Aucun dossier patient trouvé pour le code {code} dans {parent_dir}")
+    return None
 
 
 # ROT — Access instance enumeration
@@ -809,8 +828,7 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            rel_path      = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
-            relative_path = f"\\{rel_path}\\{dest.name}"
+            relative_path = f"\\{dest.relative_to(inst.dest_photos)}"
             description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             time.sleep(_GUI_PRE_INSERT_DELAY)

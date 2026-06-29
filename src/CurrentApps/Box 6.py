@@ -73,19 +73,19 @@ WATCHED_EXTENSIONS: set[str] = {
 }
 
 EXAM_DESCRIPTION: dict[str, str] = {
-    ".jpg":  "Image",
-    ".jpeg": "Image",
-    ".jfif": "Image",
-    ".png":  "Image",
-    ".bmp":  "Image",
-    ".tif":  "OCT",
-    ".tiff": "OCT",
-    ".dcm":  "DICOM",
-    ".pdf":  "Document",
-    ".rtf":  "Document",
-    ".doc":  "Document",
-    ".docx": "Document",
-    ".odt":  "Document",
+    ".jpg":  "Biométrie",
+    ".jpeg": "Biométrie",
+    ".jfif": "Biométrie",
+    ".png":  "Biométrie",
+    ".bmp":  "Biométrie",
+    ".tif":  "Biométrie",
+    ".tiff": "Biométrie",
+    ".dcm":  "Biométrie",
+    ".pdf":  "Biométrie",
+    ".rtf":  "Biométrie",
+    ".doc":  "Biométrie",
+    ".docx": "Biométrie",
+    ".odt":  "Biométrie",
 }
 
 FILE_LOCK_RETRY_DELAY:  int = 3
@@ -235,21 +235,40 @@ def resolve_patient_folder(patient: dict) -> Path | None:
     """
     Cherche le dossier patient existant via son code. Ne crée jamais de dossier.
     Retourne None si le dossier parent ou le dossier patient n'existe pas.
+
+    Le code patient peut être négatif (ex: "-4135607") ou positif (ex: "1758511228").
+    - Codes négatifs  → dossier parent à 1 chiffre : "-1.000" à "-9.000"
+    - Codes positifs  → dossier parent à 2 chiffres : "00.000" à "99.000"
+    Certains dossiers patients ont en plus un "-" parasite en tête de leur nom,
+    indépendamment du signe du code (ex: "-2186176male.flo" pour le code positif
+    "2186176") — il est ignoré lors du matching.
     """
     code = patient["code"]
-    parent_dir = DEST_PHOTOS / f"{code[:2]}.000"
+    is_negative = code.startswith("-")
+    digits = code[1:] if is_negative else code
+
+    if is_negative:
+        parent_dir = DEST_PHOTOS / f"-{digits[:1]}.000"
+    else:
+        parent_dir = DEST_PHOTOS / f"{digits[:2]}.000"
 
     if not parent_dir.is_dir():
         log.warning(f"Dossier parent introuvable pour le code {code}: {parent_dir}")
         return None
 
     for entry in parent_dir.iterdir():
-        if not entry.is_dir() or not entry.name.startswith(code):
+        if not entry.is_dir():
+            continue
+        # On ignore un éventuel "-" parasite en tête du nom de dossier, puis on
+        # ne compare que la partie numérique (le signe du code est déjà connu
+        # via parent_dir, donc on travaille uniquement sur les chiffres ici).
+        name_digits = entry.name.lstrip("-")
+        if not name_digits.startswith(digits):
             continue
         # Le caractère qui suit le code (s'il existe) ne doit pas être un chiffre,
         # sinon on risque de matcher un AUTRE code plus long qui commence pareil
         # (ex: code "175851122" matcherait à tort le dossier du code "1758511228...").
-        suffix = entry.name[len(code):]
+        suffix = name_digits[len(digits):]
         if suffix and suffix[0].isdigit():
             continue
         log.info(f"Dossier patient trouvé: {entry}")

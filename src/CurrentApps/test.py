@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -12,9 +13,9 @@ OUTPUT_DIR = Path(os.path.join(os.path.expanduser("~"), "Desktop"))
 # Reconnaît les dossiers parents : "-1.000" à "-9.000" et "00.000" à "99.000"
 PARENT_FOLDER_RE = re.compile(r"^-?\d{1,2}\.000$")
 
-# Extrait le code patient en tête du nom de dossier, en ignorant un éventuel
-# "-" parasite. Le code est la suite de chiffres consécutifs au début.
-CODE_PREFIX_RE = re.compile(r"^-?(\d+)")
+# Si le scan d'un seul dossier parent prend plus que ce délai (en secondes),
+# on affiche un avertissement explicite pour repérer un dossier réseau lent.
+SLOW_PARENT_WARNING_SECONDS = 15
 
 
 def extract_code(folder_name: str) -> str | None:
@@ -29,32 +30,47 @@ def extract_code(folder_name: str) -> str | None:
     return match.group(1)
 
 
+def log(msg: str) -> None:
+    """Affiche un message immédiatement (sans tampon) avec l'heure."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=True)
+
+
 def find_duplicate_patient_folders(root: Path) -> dict[str, list[Path]]:
     """
     Parcourt tous les dossiers parents (XX.000 / -X.000) sous root, regroupe
     leurs sous-dossiers par code patient, et retourne uniquement les codes
     ayant plusieurs dossiers DIFFÉRENTS (doublons).
+    Affiche la progression en temps réel.
     """
     by_code: dict[str, list[Path]] = {}
 
+    log(f"Lecture du contenu de {root} ...")
+    t0 = time.monotonic()
     try:
         parent_entries = sorted(root.iterdir())
     except Exception as exc:
-        print(f"ERREUR: impossible de lister {root}: {exc}")
+        log(f"ERREUR: impossible de lister {root}: {exc}")
         return {}
+    log(f"  -> {len(parent_entries)} entrée(s) trouvée(s) en {time.monotonic() - t0:.1f}s")
 
-    for parent in parent_entries:
-        if not parent.is_dir():
-            continue
-        if not PARENT_FOLDER_RE.match(parent.name):
-            continue
+    parent_folders = [p for p in parent_entries if p.is_dir() and PARENT_FOLDER_RE.match(p.name)]
+    log(f"  -> {len(parent_folders)} dossier(s) parent(s) reconnu(s) (XX.000 / -X.000)")
+
+    total_patients = 0
+    scan_start = time.monotonic()
+
+    for i, parent in enumerate(parent_folders, start=1):
+        t_parent_start = time.monotonic()
+        log(f"[{i}/{len(parent_folders)}] Scan de {parent.name} ...")
 
         try:
-            patient_entries = parent.iterdir()
+            patient_entries = list(parent.iterdir())
         except Exception as exc:
-            print(f"  ATTENTION: impossible de lister {parent}: {exc}")
+            log(f"  ATTENTION: impossible de lister {parent}: {exc}")
             continue
 
+        count_in_parent = 0
         for patient_folder in patient_entries:
             if not patient_folder.is_dir():
                 continue
@@ -62,6 +78,19 @@ def find_duplicate_patient_folders(root: Path) -> dict[str, list[Path]]:
             if code is None:
                 continue
             by_code.setdefault(code, []).append(patient_folder)
+            count_in_parent += 1
+
+        total_patients += count_in_parent
+        elapsed_parent = time.monotonic() - t_parent_start
+        log(f"  -> {count_in_parent} dossier(s) patient(s) en {elapsed_parent:.1f}s "
+            f"(total cumulé : {total_patients})")
+
+        if elapsed_parent > SLOW_PARENT_WARNING_SECONDS:
+            log(f"  !!! Ce dossier a été anormalement lent à lire ({elapsed_parent:.1f}s) "
+                f"— possible lenteur réseau sur {parent}")
+
+    total_elapsed = time.monotonic() - scan_start
+    log(f"Scan terminé : {total_patients} dossier(s) patient(s) au total en {total_elapsed:.1f}s")
 
     # On ne garde que les codes ayant 2+ dossiers DONT LES NOMS DIFFÈRENT
     duplicates: dict[str, list[Path]] = {}
@@ -101,10 +130,12 @@ def write_report(duplicates: dict[str, list[Path]], output_path: Path) -> None:
 
 
 def main() -> None:
-    print(f"Analyse de {DEST_PHOTOS} ...")
+    log(f"Analyse de {DEST_PHOTOS} ...")
 
     if not DEST_PHOTOS.is_dir():
-        print(f"ERREUR: dossier introuvable ou inaccessible : {DEST_PHOTOS}")
+        log(f"ERREUR: dossier introuvable ou inaccessible : {DEST_PHOTOS}")
+        log("Vérifiez que le lecteur réseau M: est bien connecté "
+            "(ouvrez l'explorateur de fichiers et essayez d'accéder à M:\\PHOTOS manuellement).")
         input("Appuyez sur Entrée pour fermer...")
         return
 
@@ -116,12 +147,12 @@ def main() -> None:
     try:
         write_report(duplicates, output_path)
     except Exception as exc:
-        print(f"ERREUR: impossible d'écrire le rapport: {exc}")
+        log(f"ERREUR: impossible d'écrire le rapport: {exc}")
         input("Appuyez sur Entrée pour fermer...")
         return
 
-    print(f"Terminé. {len(duplicates)} code(s) patient en doublon trouvé(s).")
-    print(f"Rapport écrit dans : {output_path}")
+    log(f"Terminé. {len(duplicates)} code(s) patient en doublon trouvé(s).")
+    log(f"Rapport écrit dans : {output_path}")
 
     try:
         os.startfile(str(output_path))

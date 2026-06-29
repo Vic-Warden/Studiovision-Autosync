@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Racine à analyser
-DEST_PHOTOS = Path(r"\\studiovision\Studiov2000-OM\PHOTOS")
+DEST_PHOTOS = Path(r"M:\PHOTOS")
 
 # Dossier de sortie du rapport (Bureau de l'utilisateur courant)
 OUTPUT_DIR = Path(os.path.join(os.path.expanduser("~"), "Desktop"))

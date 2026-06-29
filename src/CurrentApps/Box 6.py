@@ -244,9 +244,16 @@ def resolve_patient_folder(patient: dict) -> Path | None:
         return None
 
     for entry in parent_dir.iterdir():
-        if entry.is_dir() and entry.name.startswith(code):
-            log.info(f"Dossier patient trouvé: {entry}")
-            return entry
+        if not entry.is_dir() or not entry.name.startswith(code):
+            continue
+        # Le caractère qui suit le code (s'il existe) ne doit pas être un chiffre,
+        # sinon on risque de matcher un AUTRE code plus long qui commence pareil
+        # (ex: code "175851122" matcherait à tort le dossier du code "1758511228...").
+        suffix = entry.name[len(code):]
+        if suffix and suffix[0].isdigit():
+            continue
+        log.info(f"Dossier patient trouvé: {entry}")
+        return entry
 
     log.warning(f"Aucun dossier patient trouvé pour le code {code} dans {parent_dir}")
     return None

@@ -232,16 +232,24 @@ def build_patient_relative_path(patient_code: str, last_name: str, first_name: s
 
 
 def resolve_patient_folder(patient: dict) -> Path | None:
-    """Resolves and creates the absolute patient folder. Returns None on failure."""
-    try:
-        rel    = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
-        folder = DEST_PHOTOS / rel
-        folder.mkdir(parents=True, exist_ok=True)
-        log.info(f"Patient folder resolved: {folder}")
-        return folder
-    except Exception as exc:
-        log.error(f"Could not resolve/create patient folder: {exc}")
+    """
+    Cherche le dossier patient existant via son code. Ne crée jamais de dossier.
+    Retourne None si le dossier parent ou le dossier patient n'existe pas.
+    """
+    code = patient["code"]
+    parent_dir = DEST_PHOTOS / f"{code[:2]}.000"
+
+    if not parent_dir.is_dir():
+        log.warning(f"Dossier parent introuvable pour le code {code}: {parent_dir}")
         return None
+
+    for entry in parent_dir.iterdir():
+        if entry.is_dir() and entry.name.startswith(code):
+            log.info(f"Dossier patient trouvé: {entry}")
+            return entry
+
+    log.warning(f"Aucun dossier patient trouvé pour le code {code} dans {parent_dir}")
+    return None
 
 
 # Access COM — read active patient
@@ -576,8 +584,7 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            rel_path      = build_patient_relative_path(patient["code"], patient["nom"], patient["prenom"])
-            relative_path = f"\\{rel_path}\\{dest.name}"
+            relative_path = f"\\{dest.relative_to(DEST_PHOTOS)}"
             description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             time.sleep(_GUI_PRE_INSERT_DELAY)

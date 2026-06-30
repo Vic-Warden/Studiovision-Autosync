@@ -316,15 +316,8 @@ def get_active_patient() -> dict | None:
         return None
 
 
-def build_patient_relative_path(patient_code: str, last_name: str, first_name: str) -> str:
-    prefix   = patient_code[:2]
-    clean    = str.maketrans("", "", " '-")
-    last_4   = last_name.translate(clean).lower()[:4]
-    first_3  = first_name.translate(clean).lower()[:3]
-    return f"{prefix}.000\\{patient_code}{last_4}.{first_3}"
-
-
 def find_patient_folder(patient: dict) -> Path | None:
+    """Cherche le dossier en DB. Si introuvable/invalide, cherche strictement sur le disque. Ne crée rien."""
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
@@ -342,33 +335,48 @@ def find_patient_folder(patient: dict) -> Path | None:
         row = cursor.fetchone()
         conn.close()
 
-        if not row or not row[0]:
-            log.warning(
-                f"No existing document found for patient {patient['code']}. "
-                "Falling back to computed path."
-            )
-            rel_path = build_patient_relative_path(
-                patient["code"], patient["nom"], patient["prenom"]
-            )
-            folder = DEST_PHOTOS / rel_path
-            folder.mkdir(parents=True, exist_ok=True)
-            log.info(f"Patient folder created (fallback): {folder}")
-            return folder
+        if row and row[0]:
+            parts = row[0].strip().strip("\\").split("\\")
+            if len(parts) >= 2:
+                folder = DEST_PHOTOS / parts[0] / parts[1]
+                if folder.is_dir():
+                    log.info(f"Patient folder resolved via DB: {folder}")
+                    return folder
+                else:
+                    log.warning(f"Folder in DB missing on disk: {folder}. Tentative de recherche disque.")
+            else:
+                log.warning(f"Unexpected Photo externe format: {row[0]}. Tentative de recherche disque.")
+        else:
+            log.warning(f"No existing document in DB for {patient['code']}. Tentative de recherche disque.")
 
-        parts = row[0].strip().strip("\\").split("\\")
-        if len(parts) < 2:
-            log.error(f"Unexpected Photo externe format: {row[0]}")
+        # --- FALLBACK : RECHERCHE STRICTE SUR LE DISQUE ---
+        code = patient["code"]
+        is_negative = code.startswith("-")
+        digits = code[1:] if is_negative else code
+
+        parent_dir = DEST_PHOTOS / (f"-{digits[:1]}.000" if is_negative else f"{digits[:2]}.000")
+
+        if not parent_dir.is_dir():
+            log.warning(f"Dossier parent introuvable pour le code {code}: {parent_dir}")
             return None
 
-        folder = DEST_PHOTOS / parts[0] / parts[1]
-        if not folder.is_dir():
-            log.error(f"Folder found in DB but missing on disk: {folder}")
-            return None
+        for entry in parent_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            name_digits = entry.name.lstrip("-")
+            if not name_digits.startswith(digits):
+                continue
+            suffix = name_digits[len(digits):]
+            if suffix and suffix[0].isdigit():
+                continue
+            log.info(f"Dossier patient trouvé sur le disque : {entry}")
+            return entry
 
-        log.info(f"Patient folder resolved: {folder}")
-        return folder
+        log.warning(f"Aucun dossier patient trouvé pour le code {code} dans {parent_dir}")
+        return None
+
     except Exception as e:
-        log.error(f"DB folder lookup failed: {e}")
+        log.error(f"DB folder lookup / search failed: {e}")
         return None
 
 
@@ -742,8 +750,7 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            group_name    = patient_folder.parent.name
-            relative_path = f"\\{group_name}\\{patient_folder.name}\\{dest.name}"
+            relative_path = f"\\{dest.relative_to(DEST_PHOTOS)}"
             description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
 
             if insert_document(patient, relative_path, description):

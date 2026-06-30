@@ -17,7 +17,6 @@ PARENT_FOLDER_RE = re.compile(r"^-?\d{1,2}\.000$")
 # on affiche un avertissement explicite pour repérer un dossier réseau lent.
 SLOW_PARENT_WARNING_SECONDS = 15
 
-
 def extract_code(folder_name: str) -> str | None:
     """
     Retourne le code patient (suite de chiffres en tête, "-" parasite ignoré)
